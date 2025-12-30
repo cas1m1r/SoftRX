@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoftRX - Sandbox Framework</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0a0e1a;
+            --bg-secondary: #151b2e;
+            --bg-tertiary: #1e2740;
+            --accent-primary: #00d4ff;
+            --accent-secondary: #8b5cf6;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --border: #2d3748;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, var(--bg-primary) 0%, #1a1f35 100%);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding: 2rem 0;
+            border-bottom: 2px solid var(--border);
+        }
+
+        h1 {
+            font-size: 3rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            border-bottom: 2px solid var(--border);
+        }
+
+        .tab {
+            padding: 1rem 2rem;
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-bottom: 3px solid transparent;
+        }
+
+        .tab:hover {
+            color: var(--text-primary);
+        }
+
+        .tab.active {
+            color: var(--accent-primary);
+            border-bottom-color: var(--accent-primary);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.3s;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .card-title {
+            font-size: 1.5rem;
+            margin-bottom: 1.5rem;
+            color: var(--accent-primary);
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        input[type="text"],
+        input[type="number"],
+        input[type="file"],
+        select,
+        textarea {
+            width: 100%;
+            padding: 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            transition: all 0.3s;
+        }
+
+        input:focus,
+        select:focus,
+        textarea:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+        }
+
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(0, 212, 255, 0.3);
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover {
+            background: var(--border);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+
+        .run-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .run-card {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .run-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 8px 24px rgba(0, 212, 255, 0.2);
+            border-color: var(--accent-primary);
+        }
+
+        .run-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+
+        .run-id {
+            font-size: 0.9rem;
+            color: var(--accent-primary);
+            font-family: 'Courier New', monospace;
+        }
+
+        .status-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .status-success {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .status-error {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+
+        .run-sample {
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .run-meta {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .run-meta span {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            overflow-y: auto;
+        }
+
+        .modal.active {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            max-width: 1200px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+            margin: 2rem;
+        }
+
+        .modal-header {
+            padding: 2rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-body {
+            padding: 2rem;
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 2rem;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .close-btn:hover {
+            color: var(--text-primary);
+        }
+
+        .event-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .event-item {
+            background: var(--bg-tertiary);
+            border-left: 3px solid var(--accent-primary);
+            padding: 1rem;
+            border-radius: 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+        }
+
+        .event-type {
+            color: var(--accent-primary);
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .event-details {
+            color: var(--text-secondary);
+        }
+
+        .loading {
+            text-align: center;
+            padding: 3rem;
+        }
+
+        .spinner {
+            border: 3px solid var(--bg-tertiary);
+            border-top: 3px solid var(--accent-primary);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .upload-zone {
+            border: 2px dashed var(--border);
+            border-radius: 12px;
+            padding: 3rem;
+            text-align: center;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+
+        .upload-zone:hover,
+        .upload-zone.dragover {
+            border-color: var(--accent-primary);
+            background: rgba(0, 212, 255, 0.05);
+        }
+
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .code-block {
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+        }
+
+        .artifact-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .artifact-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--bg-tertiary);
+            padding: 1rem;
+            border-radius: 8px;
+        }
+
+        .notification {
+            position: fixed;
+            top: 2rem;
+            right: 2rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+            z-index: 2000;
+            display: none;
+        }
+
+        .notification.show {
+            display: block;
+            animation: slideIn 0.3s;
+        }
+
+        @keyframes slideIn {
+            from { transform: translateX(400px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        .category-tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .category-tab {
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .category-tab.active {
+            background: var(--accent-primary);
+            color: var(--bg-primary);
+            border-color: var(--accent-primary);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔒 SoftRX</h1>
+            <p class="subtitle">Sandbox & Reverse Engineering Framework</p>
+        </header>
+
+        <div class="tabs">
+            <button class="tab active" data-tab="execute">Execute</button>
+            <button class="tab" data-tab="runs">Runs History</button>
+            <button class="tab" data-tab="upload">Upload Sample</button>
+            <button class="tab" data-tab="debug">Debug</button>
+        </div>
+
+        <!-- Execute Tab -->
+        <div class="tab-content active" id="execute-tab">
+            <div class="card">
+                <h2 class="card-title">Execute Sample</h2>
+                
+                <div class="form-group">
+                    <label>Select Sample</label>
+                    <select id="sample-select">
+                        <option value="">Loading samples...</option>
+                    </select>
+                </div>
+
+                <div class="settings-grid">
+                    <div class="form-group">
+                        <label>Timeout (seconds)</label>
+                        <input type="number" id="timeout" value="4.0" step="0.1" min="0.1">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Max Events</label>
+                        <input type="number" id="max-events" value="200" min="1">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Execution Mode</label>
+                        <select id="mode">
+                            <option value="malware">Malware (Strict)</option>
+                            <option value="re">Reverse Engineering</option>
+                            <option value="dev">Development</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Sample Arguments (optional)</label>
+                    <input type="text" id="sample-args" placeholder="arg1 arg2 arg3">
+                </div>
+
+                <button class="btn btn-primary" id="execute-btn">
+                    <span>🚀</span> Execute Sample
+                </button>
+            </div>
+        </div>
+
+        <!-- Runs History Tab -->
+        <div class="tab-content" id="runs-tab">
+            <div class="card">
+                <h2 class="card-title">Runs History</h2>
+                <div id="runs-container" class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading runs...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Upload Tab -->
+        <div class="tab-content" id="upload-tab">
+            <div class="card">
+                <h2 class="card-title">Upload Sample</h2>
+                
+                <div class="upload-zone" id="upload-zone">
+                    <div style="font-size: 3rem; margin-bottom: 1rem;">📁</div>
+                    <h3>Drop files here or click to browse</h3>
+                    <p style="color: var(--text-secondary); margin-top: 0.5rem;">
+                        Maximum file size: 100MB
+                    </p>
+                    <input type="file" id="file-input" style="display: none;">
+                </div>
+
+                <div id="upload-progress" style="display: none; margin-top: 1rem;">
+                    <div style="background: var(--bg-tertiary); border-radius: 8px; height: 8px; overflow: hidden;">
+                        <div id="progress-bar" style="background: var(--accent-primary); height: 100%; width: 0%; transition: width 0.3s;"></div>
+                    </div>
+                    <p id="upload-status" style="text-align: center; margin-top: 0.5rem; color: var(--text-secondary);"></p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Debug Tab -->
+        <div class="tab-content" id="debug-tab">
+            <div class="card">
+                <h2 class="card-title">Debug Information</h2>
+                <button class="btn btn-primary" onclick="loadDebugInfo()" style="margin-bottom: 1rem;">
+                    🔄 Refresh Debug Info
+                </button>
+                <div id="debug-info" class="code-block">
+                    <div style="color: var(--text-secondary);">Click refresh to load debug information...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">Recent Console Output</h2>
+                <div id="console-output" class="code-block" style="max-height: 400px; overflow-y: auto; font-size: 0.8rem;">
+                    <div style="color: var(--text-secondary);">Console output will appear here...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Run Details Modal -->
+    <div class="modal" id="run-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">Run Details</h2>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading run details...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification -->
+    <div class="notification" id="notification"></div>
+
+    <script>
+        // State
+        let currentTab = 'execute';
+        let runs = [];
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            setupTabs();
+            setupUpload();
+            loadSamples();
+            loadRuns();
+            setupExecute();
+        });
+
+        // Tab Management
+        function setupTabs() {
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.addEventListener('click', () => {
+                    const tabName = tab.dataset.tab;
+                    switchTab(tabName);
+                });
+            });
+        }
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            document.querySelector(`[data-tab="${tabName}"]`).classList.add('active');
+            document.getElementById(`${tabName}-tab`).classList.add('active');
+            
+            currentTab = tabName;
+            
+            if (tabName === 'runs') {
+                loadRuns();
+            }
+        }
+
+        // Load Samples
+        async function loadSamples() {
+            try {
+                const response = await fetch('/api/samples');
+                const samples = await response.json();
+                
+                const select = document.getElementById('sample-select');
+                select.innerHTML = samples.length === 0 
+                    ? '<option value="">No samples available - upload one first</option>'
+                    : '<option value="">Select a sample...</option>';
+                
+                samples.forEach(sample => {
+                    const option = document.createElement('option');
+                    option.value = sample.path;
+                    option.textContent = `${sample.name} (${(sample.size / 1024).toFixed(1)} KB)`;
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                showNotification('Error loading samples', 'error');
+            }
+        }
+
+        // Execute Sample
+        function setupExecute() {
+            document.getElementById('execute-btn').addEventListener('click', async () => {
+                const samplePath = document.getElementById('sample-select').value;
+                if (!samplePath) {
+                    showNotification('Please select a sample', 'error');
+                    return;
+                }
+
+                const btn = document.getElementById('execute-btn');
+                btn.disabled = true;
+                btn.innerHTML = '<span>⏳</span> Executing...';
+
+                const args = document.getElementById('sample-args').value
+                    .split(' ')
+                    .filter(a => a.trim());
+
+                try {
+                    const response = await fetch('/api/execute', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            sample_path: samplePath,
+                            timeout: parseFloat(document.getElementById('timeout').value),
+                            max_events: parseInt(document.getElementById('max-events').value),
+                            mode: document.getElementById('mode').value,
+                            args: args
+                        })
+                    });
+
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        showNotification('Execution completed! Run ID: ' + result.run_id, 'success');
+                        
+                        // Log output for debugging
+                        if (result.stdout) console.log('STDOUT:', result.stdout);
+                        if (result.stderr) console.log('STDERR:', result.stderr);
+                        
+                        switchTab('runs');
+                        setTimeout(loadRuns, 500);
+                    } else {
+                        let errorMsg = result.error || 'Execution failed';
+                        if (result.stdout) errorMsg += '\n\nStdout: ' + result.stdout;
+                        if (result.stderr) errorMsg += '\n\nStderr: ' + result.stderr;
+                        console.error('Execution failed:', errorMsg);
+                        showNotification(result.error || 'Execution failed', 'error');
+                    }
+                } catch (error) {
+                    console.error('Exception during execution:', error);
+                    showNotification('Error executing sample: ' + error.message, 'error');
+                } finally {
+                    btn.disabled = false;
+                    btn.innerHTML = '<span>🚀</span> Execute Sample';
+                }
+            });
+        }
+
+        // Load Runs
+        async function loadRuns() {
+            const container = document.getElementById('runs-container');
+            container.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading runs...</p></div>';
+
+            try {
+                const response = await fetch('/api/runs');
+                runs = await response.json();
+
+                if (runs.length === 0) {
+                    container.innerHTML = '<p style="text-align: center; color: var(--text-secondary);">No runs yet. Execute a sample to get started!</p>';
+                    return;
+                }
+
+                container.innerHTML = '';
+                const grid = document.createElement('div');
+                grid.className = 'run-grid';
+
+                runs.forEach(run => {
+                    const card = createRunCard(run);
+                    grid.appendChild(card);
+                });
+
+                container.appendChild(grid);
+            } catch (error) {
+                container.innerHTML = '<p style="text-align: center; color: var(--danger);">Error loading runs</p>';
+            }
+        }
+
+        function createRunCard(run) {
+            const card = document.createElement('div');
+            card.className = 'run-card';
+            card.onclick = () => showRunDetails(run.id);
+
+            const status = run.returncode === 0 ? 'success' : 'error';
+            const sampleName = run.sample.split('/').pop();
+
+            card.innerHTML = `
+                <div class="run-card-header">
+                    <div class="run-id">${run.id}</div>
+                    <div class="status-badge status-${status}">
+                        ${run.returncode === 0 ? '✓ Success' : '✗ Error'}
+                    </div>
+                </div>
+                <div class="run-sample">${sampleName}</div>
+                <div class="run-meta">
+                    <span>⏱️ ${run.duration}s</span>
+                    <span>📊 ${run.event_count} events</span>
+                </div>
+            `;
+
+            return card;
+        }
+
+        // Show Run Details
+        async function showRunDetails(runId) {
+            const modal = document.getElementById('run-modal');
+            const body = document.getElementById('modal-body');
+            
+            modal.classList.add('active');
+            body.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading details...</p></div>';
+
+            try {
+                const response = await fetch(`/api/run/${runId}`);
+                const data = await response.json();
+
+                body.innerHTML = generateRunDetailsHTML(data);
+                setupCategoryTabs(data.categorized_events);
+            } catch (error) {
+                body.innerHTML = '<p style="color: var(--danger);">Error loading run details</p>';
+            }
+        }
+
+        function generateRunDetailsHTML(data) {
+            const report = data.report;
+            const cats = data.categorized_events;
+            
+            let html = `
+                <div style="margin-bottom: 2rem;">
+                    <h3 style="color: var(--accent-primary); margin-bottom: 1rem;">Overview</h3>
+                    <div class="code-block">
+                        <div><strong>Sample:</strong> ${report.sample}</div>
+                        <div><strong>Duration:</strong> ${report.duration_s}s</div>
+                        <div><strong>Return Code:</strong> ${report.returncode}</div>
+                        <div><strong>Events:</strong> ${report.events.length}</div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 2rem;">
+                    <h3 style="color: var(--accent-primary); margin-bottom: 1rem;">Events by Category</h3>
+                    <div class="category-tabs">
+                        <div class="category-tab active" data-category="filesystem">
+                            📁 Filesystem (${cats.filesystem.length})
+                        </div>
+                        <div class="category-tab" data-category="network">
+                            🌐 Network (${cats.network.length})
+                        </div>
+                        <div class="category-tab" data-category="process">
+                            ⚙️ Process (${cats.process.length})
+                        </div>
+                        <div class="category-tab" data-category="memory">
+                            💾 Memory (${cats.memory.length})
+                        </div>
+                        <div class="category-tab" data-category="other">
+                            📋 Other (${cats.other.length})
+                        </div>
+                    </div>
+                    <div id="category-content"></div>
+                </div>
+            `;
+
+            if (data.artifacts.length > 0) {
+                html += `
+                    <div>
+                        <h3 style="color: var(--accent-primary); margin-bottom: 1rem;">Artifacts</h3>
+                        <div class="artifact-list">
+                `;
+                
+                data.artifacts.forEach(artifact => {
+                    html += `
+                        <div class="artifact-item">
+                            <div>
+                                <strong>${artifact.name}</strong>
+                                <div style="font-size: 0.85rem; color: var(--text-secondary);">
+                                    ${artifact.path} (${(artifact.size / 1024).toFixed(1)} KB)
+                                </div>
+                            </div>
+                            <button class="btn btn-secondary" onclick="downloadArtifact('${data.run_id}', '${artifact.path}')">
+                                Download
+                            </button>
+                        </div>
+                    `;
+                });
+                
+                html += `
+                        </div>
+                    </div>
+                `;
+            }
+
+            return html;
+        }
+
+        function setupCategoryTabs(categorizedEvents) {
+            const tabs = document.querySelectorAll('.category-tab');
+            const content = document.getElementById('category-content');
+
+            tabs.forEach(tab => {
+                tab.addEventListener('click', () => {
+                    tabs.forEach(t => t.classList.remove('active'));
+                    tab.classList.add('active');
+                    
+                    const category = tab.dataset.category;
+                    displayCategoryEvents(content, categorizedEvents[category]);
+                });
+            });
+
+            // Show first category by default
+            displayCategoryEvents(content, categorizedEvents.filesystem);
+        }
+
+        function displayCategoryEvents(container, events) {
+            if (events.length === 0) {
+                container.innerHTML = '<p style="text-align: center; color: var(--text-secondary); padding: 2rem;">No events in this category</p>';
+                return;
+            }
+
+            container.innerHTML = '<div class="event-list"></div>';
+            const list = container.querySelector('.event-list');
+
+            events.forEach(event => {
+                const item = document.createElement('div');
+                item.className = 'event-item';
+                
+                const details = Object.entries(event)
+                    .filter(([key]) => key !== 'event')
+                    .map(([key, val]) => `${key}: ${JSON.stringify(val)}`)
+                    .join('\n');
+
+                item.innerHTML = `
+                    <div class="event-type">${event.event}</div>
+                    <div class="event-details">${details}</div>
+                `;
+                list.appendChild(item);
+            });
+        }
+
+        function downloadArtifact(runId, artifactPath) {
+            window.location.href = `/api/run/${runId}/artifact/${artifactPath}`;
+        }
+
+        function closeModal() {
+            document.getElementById('run-modal').classList.remove('active');
+        }
+
+        // Upload
+        function setupUpload() {
+            const zone = document.getElementById('upload-zone');
+            const input = document.getElementById('file-input');
+
+            zone.addEventListener('click', () => input.click());
+            
+            zone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                zone.classList.add('dragover');
+            });
+
+            zone.addEventListener('dragleave', () => {
+                zone.classList.remove('dragover');
+            });
+
+            zone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                zone.classList.remove('dragover');
+                if (e.dataTransfer.files.length > 0) {
+                    uploadFile(e.dataTransfer.files[0]);
+                }
+            });
+
+            input.addEventListener('change', () => {
+                if (input.files.length > 0) {
+                    uploadFile(input.files[0]);
+                }
+            });
+        }
+
+        async function uploadFile(file) {
+            const progress = document.getElementById('upload-progress');
+            const bar = document.getElementById('progress-bar');
+            const status = document.getElementById('upload-status');
+
+            progress.style.display = 'block';
+            bar.style.width = '0%';
+            status.textContent = 'Uploading...';
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    bar.style.width = '100%';
+                    status.textContent = `✓ Uploaded: ${result.filename}`;
+                    showNotification('File uploaded successfully!', 'success');
+                    setTimeout(() => {
+                        loadSamples();
+                        switchTab('execute');
+                    }, 1500);
+                } else {
+                    status.textContent = '✗ Upload failed';
+                    showNotification(result.error || 'Upload failed', 'error');
+                }
+            } catch (error) {
+                status.textContent = '✗ Upload failed';
+                showNotification('Error uploading file', 'error');
+            }
+        }
+
+        // Notifications
+        function showNotification(message, type = 'info') {
+            const notification = document.getElementById('notification');
+            const colors = {
+                success: 'var(--success)',
+                error: 'var(--danger)',
+                info: 'var(--accent-primary)'
+            };
+            
+            notification.style.borderLeft = `4px solid ${colors[type]}`;
+            notification.innerHTML = `
+                <strong style="display: block; margin-bottom: 0.5rem;">${type === 'success' ? '✓' : type === 'error' ? '✗' : 'ℹ'} ${type.toUpperCase()}</strong>
+                <div>${message}</div>
+            `;
+            notification.classList.add('show');
+            
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 4000);
+        }
+
+        // Click outside modal to close
+        document.getElementById('run-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'run-modal') {
+                closeModal();
+            }
+        });
+
+        // Debug functions
+        async function loadDebugInfo() {
+            const debugDiv = document.getElementById('debug-info');
+            debugDiv.innerHTML = '<div style="color: var(--text-secondary);">Loading...</div>';
+            
+            try {
+                const response = await fetch('/api/debug');
+                const data = await response.json();
+                
+                let html = '<div style="line-height: 1.8;">';
+                html += `<div><strong>Root Directory:</strong> ${data.root}</div>`;
+                html += `<div><strong>SoftRXCTL Path:</strong> ${data.softrxctl}</div>`;
+                html += `<div><strong>SoftRXCTL Exists:</strong> ${data.softrxctl_exists ? '✓ Yes' : '✗ No'}</div>`;
+                html += `<div><strong>Runs Directory:</strong> ${data.runs_dir}</div>`;
+                html += `<div><strong>Runs Dir Exists:</strong> ${data.runs_dir_exists ? '✓ Yes' : '✗ No'}</div>`;
+                html += `<div><strong>Upload Folder:</strong> ${data.upload_folder}</div>`;
+                html += `<div><strong>Total Runs:</strong> ${data.run_count}</div>`;
+                html += '</div>';
+                
+                debugDiv.innerHTML = html;
+            } catch (error) {
+                debugDiv.innerHTML = `<div style="color: var(--danger);">Error: ${error.message}</div>`;
+            }
+        }
+
+        // Capture console output
+        const originalLog = console.log;
+        const originalError = console.error;
+        const consoleOutput = document.getElementById('console-output');
+        let consoleLines = [];
+
+        console.log = function(...args) {
+            originalLog.apply(console, args);
+            addToConsole('log', args);
+        };
+
+        console.error = function(...args) {
+            originalError.apply(console, args);
+            addToConsole('error', args);
+        };
+
+        function addToConsole(type, args) {
+            const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ');
+            const color = type === 'error' ? 'var(--danger)' : 'var(--text-secondary)';
+            const timestamp = new Date().toLocaleTimeString();
+            
+            consoleLines.push(`<div style="color: ${color};">[${timestamp}] ${msg}</div>`);
+            if (consoleLines.length > 50) consoleLines.shift();
+            
+            if (consoleOutput) {
+                consoleOutput.innerHTML = consoleLines.join('');
+                consoleOutput.scrollTop = consoleOutput.scrollHeight;
+            }
+        }
+    </script>
+</body>
+</html>
