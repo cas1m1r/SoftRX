@@ -18,7 +18,8 @@ import os, re, signal
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
-# UPLOAD_FOLDER is set after ROOT discovery (see below)
+app.config['UPLOAD_FOLDER'] = Path(__file__).parent / 'uploads'
+app.config['UPLOAD_FOLDER'].mkdir(exist_ok=True)
 
 def _find_repo_root(start: Path) -> Path:
     """Find the directory that contains softrxctl.py (repo root-ish).
@@ -33,31 +34,10 @@ def _find_repo_root(start: Path) -> Path:
 
 ROOT = _find_repo_root(Path(__file__).resolve().parent)
 
-# Use repo-root anchored paths (works even if this Flask file lives in /web)
-app.config['UPLOAD_FOLDER'] = ROOT / 'uploads'
-app.config['UPLOAD_FOLDER'].mkdir(parents=True, exist_ok=True)
-
-# UI index discovery (support root/, templates/, web/templates/)
-def _find_index_html() -> Path:
-    candidates = [
-        ROOT / 'web' / 'templates' / 'index.html',
-        ROOT / 'web' / 'index.html',
-        ROOT / 'templates' / 'index.html',
-        ROOT / 'index.html',
-        Path(__file__).resolve().parent / 'templates' / 'index.html',
-        Path(__file__).resolve().parent / 'index.html',
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return ROOT / 'templates' /'index.html'
-
-INDEX_HTML = _find_index_html()
-
 SOFTRXCTL = ROOT / "softrxctl.py"
 RUNS_DIR = ROOT / "softrx_runs"
 UPLOADS_DIR = ROOT / "uploads"
-SAMPLES_DIR = UPLOADS_DIR / "samples"   # adjust to your actual layout
+SAMPLES_DIR = UPLOADS_DIR / "ex"   # adjust to your actual layout
 
 # Ensure runs directory exists
 RUNS_DIR.mkdir(exist_ok=True)
@@ -69,6 +49,30 @@ def _safe_read_json(path: Path, default=None):
     except Exception:
         return default
 
+
+
+def _find_latest_events_file(run_dir: Path):
+    """Return the newest events file for a run (supports events.ndjson / events.json / events*.{ndjson,json})."""
+    if not run_dir.exists() or not run_dir.is_dir():
+        return None
+    candidates = []
+    # Preferred canonical names
+    for name in ('events.ndjson', 'events.json'):
+        p = run_dir / name
+        if p.exists() and p.is_file():
+            candidates.append(p)
+    # Also accept numbered variants or legacy names
+    for pat in ('events*.ndjson', 'events*.json'):
+        for p in run_dir.glob(pat):
+            if p.exists() and p.is_file():
+                candidates.append(p)
+    if not candidates:
+        return None
+    # Deduplicate by resolved path
+    uniq = {p.resolve(): p for p in candidates}
+    candidates = list(uniq.values())
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 def get_all_runs():
     runs = []
@@ -161,14 +165,7 @@ def parse_events(events):
 @app.route('/')
 def index():
     """Serve the single-page UI."""
-    return send_file(INDEX_HTML)
-
-
-@app.route('/favicon.ico')
-def favicon():
-    # avoid noisy 404s in logs
-    return ("", 204)
-
+    return send_file(ROOT / "index.html")
 
 
 @app.route('/api/config')
@@ -271,6 +268,30 @@ def api_run_detail(run_id):
         'run_id': run_id,
     })
 
+
+
+@app.route('/api/run/<run_id>/events')
+def api_run_events_download(run_id):
+    """Download the raw events file for a run (events.ndjson or events.json)."""
+    run_dir = RUNS_DIR / run_id
+    p = _find_latest_events_file(run_dir)
+    if p is None:
+        return jsonify({'error': 'Events not found'}), 404
+    # Default to download behavior (button uses this endpoint).
+    download = request.args.get('download', '1') != '0'
+    mt = 'application/x-ndjson' if p.suffix == '.ndjson' else 'application/json'
+    return send_file(str(p), mimetype=mt, as_attachment=download, download_name=p.name)
+
+
+@app.route('/api/run/<run_id>/report')
+def api_run_report_download(run_id):
+    """Download report.json for a run if present."""
+    run_dir = RUNS_DIR / run_id
+    p = run_dir / 'report.json'
+    if not p.exists() or not p.is_file():
+        return jsonify({'error': 'Report not found'}), 404
+    download = request.args.get('download', '1') != '0'
+    return send_file(str(p), mimetype='application/json', as_attachment=download, download_name='report.json')
 
 @app.route('/api/run/<run_id>/artifact/<path:artifact_path>')
 def api_download_artifact(run_id, artifact_path):
