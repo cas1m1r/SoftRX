@@ -309,6 +309,12 @@ typedef struct {
     pid_t tracee;
     pid_t tracee_pgid;
     pid_t cur_pid;
+    uint64_t evt_idx;
+    // Cached process identity (derived from /proc/<tid>/status)
+    pid_t cache_tid;
+    pid_t cache_pid;   // tgid
+    pid_t cache_ppid;
+    char  cache_comm[64];
     int notify_fd;
     char outdir[4096];
     char write_jail[4096];
@@ -464,9 +470,82 @@ static void dump_sockmap_json(supervisor_ctx_t *c, const char *dst_path) {
 
 static void snapshot_and_kill(supervisor_ctx_t *c, const char *why);
 
+static void json_escape(FILE *fp, const char *s) {
+    if (!s) return;
+    for (const unsigned char *p = (const unsigned char*)s; *p; ++p) {
+        unsigned char ch = *p;
+        switch (ch) {
+            case '\\': fputs("\\\\", fp); break;
+            case '"':  fputs("\\\"", fp); break;
+            case '\n': fputs("\\n", fp); break;
+            case '\r': fputs("\\r", fp); break;
+            case '\t': fputs("\\t", fp); break;
+            default:
+                if (ch < 0x20) fprintf(fp, "\\u%04x", ch);
+                else fputc(ch, fp);
+        }
+    }
+}
+
+static void cache_proc_identity(supervisor_ctx_t *c, pid_t tid) {
+    if (tid <= 0) return;
+    if (c->cache_tid == tid && c->cache_comm[0] != '\0') return;
+
+    c->cache_tid = tid;
+    c->cache_pid = tid;     // fallback if /proc parsing fails
+    c->cache_ppid = -1;
+    c->cache_comm[0] = '\0';
+
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/%d/status", tid);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "Name:", 5) == 0) {
+            char name[64] = {0};
+            if (sscanf(line + 5, "%63s", name) == 1) {
+                strncpy(c->cache_comm, name, sizeof(c->cache_comm) - 1);
+                c->cache_comm[sizeof(c->cache_comm) - 1] = '\0';
+            }
+        } else if (strncmp(line, "Tgid:", 5) == 0) {
+            int tgid = 0;
+            if (sscanf(line + 5, "%d", &tgid) == 1 && tgid > 0) c->cache_pid = (pid_t)tgid;
+        } else if (strncmp(line, "PPid:", 5) == 0) {
+            int ppid = 0;
+            if (sscanf(line + 5, "%d", &ppid) == 1) c->cache_ppid = (pid_t)ppid;
+        }
+    }
+    fclose(fp);
+}
+
 static void emit_evt(supervisor_ctx_t *c, const char *event, const char *fmt, ...) {
     uint64_t ts = now_ms();
-    fprintf(c->events_fp, "{\"ts_ms\":%llu,\"event\":\"%s\"", (unsigned long long)ts, event);
+    uint64_t idx = c->evt_idx++;
+
+    // seccomp USER_NOTIF supplies a tid (req->pid). We store it in c->cur_pid.
+    pid_t tid = c->cur_pid > 0 ? c->cur_pid : getpid();
+    cache_proc_identity(c, tid);
+
+    // Canonical identity: pid = TGID (process id), tid = thread id.
+    fprintf(c->events_fp,
+            "{\"ts_ms\":%llu,\"idx\":%llu,\"event\":\"%s\",\"pid\":%d,\"tid\":%d",
+            (unsigned long long)ts,
+            (unsigned long long)idx,
+            event,
+            (int)c->cache_pid,
+            (int)tid);
+
+    if (c->cache_ppid > 0) {
+        fprintf(c->events_fp, ",\"ppid\":%d", (int)c->cache_ppid);
+    }
+    if (c->cache_comm[0]) {
+        fprintf(c->events_fp, ",\"comm\":\"");
+        json_escape(c->events_fp, c->cache_comm);
+        fprintf(c->events_fp, "\"");
+    }
+
     if (fmt && fmt[0]) {
         fprintf(c->events_fp, ",");
         va_list ap;
@@ -848,7 +927,7 @@ if (c->mode == MODE_DEV) {
         respond_errno(c->notify_fd, req->id, EPERM);
         return;
     }
-    emit_evt(c, "exec_allow_dev", "\"pid\":%d,\"abs\":\"%s\"", (int)c->cur_pid, abs);
+    emit_evt(c, "exec_allow_dev", "\"abs\":\"%s\"", abs);
     respond_continue(c->notify_fd, req->id);
     return;
 }
@@ -1231,13 +1310,12 @@ static void handle_mprotect(supervisor_ctx_t *c, struct seccomp_notif *req) {
     bool adds_exec = (prot & PROT_EXEC) != 0;
 
     emit_evt(c, "mprotect",
-             "\"pid\":%d,\"addr\":\"0x%llx\",\"len\":%llu,\"prot\":%d,\"adds_exec\":%s",
-             (int)c->cur_pid,
+             "\"addr\":\"0x%llx\",\"len\":%llu,\"prot\":%d,\"adds_exec\":%s",
              (unsigned long long)addr, (unsigned long long)len, prot, adds_exec?"true":"false");
 
     if (adds_exec) {
         if (c->mode == MODE_DEV) {
-            emit_evt(c, "mprotect_exec_allowed_dev", "\"pid\":%d", (int)c->cur_pid);
+            emit_evt(c, "mprotect_exec_allowed_dev", "");
             respond_continue(c->notify_fd, req->id);
             return;
         }
@@ -1258,27 +1336,27 @@ static void handle_fd(supervisor_ctx_t *c, struct seccomp_notif *req) {
         case __NR_write: {
             size_t cnt = (size_t)req->data.args[2];
             emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
-                     "\"pid\":%d,\"fd\":%d,\"count\":%zu", (int)c->cur_pid, fd, cnt);
+                     "\"fd\":%d,\"count\":%zu", fd, cnt);
             break;
         }
         case __NR_readv:
         case __NR_writev: {
             int iovcnt = (int)req->data.args[2];
             emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
-                     "\"pid\":%d,\"fd\":%d,\"iovcnt\":%d", (int)c->cur_pid, fd, iovcnt);
+                     "\"fd\":%d,\"iovcnt\":%d", fd, iovcnt);
             break;
         }
         case __NR_close:
-            emit_evt(c, "fd_close", "\"pid\":%d,\"fd\":%d", (int)c->cur_pid, fd);
+            emit_evt(c, "fd_close", "\"fd\":%d", fd);
             break;
         case __NR_fcntl: {
             long cmd = (long)req->data.args[1];
-            emit_evt(c, "fd_fcntl", "\"pid\":%d,\"fd\":%d,\"cmd\":%ld", (int)c->cur_pid, fd, cmd);
+            emit_evt(c, "fd_fcntl", "\"fd\":%d,\"cmd\":%ld", fd, cmd);
             break;
         }
         case __NR_ioctl: {
             unsigned long cmd = (unsigned long)req->data.args[1];
-            emit_evt(c, "fd_ioctl", "\"pid\":%d,\"fd\":%d,\"cmd\":%lu", (int)c->cur_pid, fd, (unsigned long)cmd);
+            emit_evt(c, "fd_ioctl", "\"fd\":%d,\"cmd\":%lu", fd, (unsigned long)cmd);
             break;
         }
         case __NR_dup:
@@ -1286,16 +1364,16 @@ static void handle_fd(supervisor_ctx_t *c, struct seccomp_notif *req) {
         case __NR_dup3: {
             int oldfd = (int)req->data.args[0];
             int newfd = (nr==__NR_dup) ? -1 : (int)req->data.args[1];
-            emit_evt(c, "fd_dup", "\"pid\":%d,\"nr\":%d,\"oldfd\":%d,\"newfd\":%d",
-                     (int)c->cur_pid, nr, oldfd, newfd);
+            emit_evt(c, "fd_dup", "\"nr\":%d,\"oldfd\":%d,\"newfd\":%d",
+                     nr, oldfd, newfd);
             break;
         }
         case __NR_poll:
         case __NR_ppoll:
-            emit_evt(c, "fd_poll", "\"pid\":%d,\"nr\":%d", (int)c->cur_pid, nr);
+            emit_evt(c, "fd_poll", "\"nr\":%d", nr);
             break;
         default:
-            emit_evt(c, "fd_misc", "\"pid\":%d,\"nr\":%d,\"fd\":%d", (int)c->cur_pid, nr, fd);
+            emit_evt(c, "fd_misc", "\"nr\":%d,\"fd\":%d", nr, fd);
             break;
     }
 
@@ -1316,7 +1394,7 @@ static void *supervisor_thread(void *arg) {
     uint64_t start = now_ms();
     int events = 0;
 
-    emit_evt(c, "supervisor_start", "\"pid\":%d,\"notify_fd\":%d", c->tracee, c->notify_fd);
+    emit_evt(c, "supervisor_start", "\"notify_fd\":%d", c->notify_fd);
 
     while (1) {
         if (c->timeout_ms && (now_ms() - start) > c->timeout_ms) {

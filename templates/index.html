@@ -681,7 +681,7 @@
       document.getElementById('modal-body').innerHTML = '<div class="subtle">Loading…</div>';
 
       try {
-        const r = await fetch(`/api/run/${encodeURIComponent(runId)}`);
+        const r = await fetch(`/api/run/${encodeURIComponent(runId)}?${_qsFromOpts(window.__runState.opts)}`);
         const data = await r.json();
         if (data.error) throw new Error(data.error);
         renderRunModal(data);
@@ -703,7 +703,7 @@
 
       const tabs = [
         { id: 'overview', label: 'Overview' },
-        { id: 'timeline', label: `Timeline (${summary.event_count || (report.event_count||0)})` },
+        { id: 'timeline', label: `Timeline (${(summary.timeline_count ?? summary.event_count ?? (data.timeline ? data.timeline.length : 0) ?? (report.event_count||0))})` },
         { id: 'artifacts', label: `Artifacts (${(data.artifacts||[]).length})` },
         { id: 'snapshots', label: `Snapshots (${(data.snapshots||[]).length})` },
         { id: 'raw', label: 'Raw JSON' },
@@ -775,29 +775,92 @@
       `;
     }
 
+    
+    // -------- Enriched runtime UI (process tree + stages + compact timeline) --------
+    window.__runState = window.__runState || { runId: null, opts: { hide_mem: true, collapse_loader: true, group_fd: true } };
+    window.__filters = window.__filters || { pid: null, stage_id: null };
+
+    function _qsFromOpts(opts) {
+      const p = new URLSearchParams();
+      p.set('hide_mem', opts.hide_mem ? '1' : '0');
+      p.set('collapse_loader', opts.collapse_loader ? '1' : '0');
+      p.set('group_fd', opts.group_fd ? '1' : '0');
+      return p.toString();
+    }
+
+    async function refetchRunWithOpts() {
+      const st = window.__runState;
+      if (!st.runId) return;
+      const qs = _qsFromOpts(st.opts);
+      const r = await fetch(`/api/run/${encodeURIComponent(st.runId)}?${qs}`);
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+      // Re-render only timeline (keeps other tabs intact)
+      renderTimeline(data);
+      // Keep summary badges roughly correct
+      try { renderOverview(data); } catch (_) {}
+    }
+
     function renderTimeline(data) {
       const report = data.report || {};
-      const events = (report.events || []);
+      const timeline = (data.timeline || (report.events || []));
+      const processes = (data.processes || []);
+      const procTree = (data.process_tree || []);
+      const stages = (data.stages || []);
       const wrap = document.getElementById('inner-timeline');
 
-      if (!events.length) {
+      if (!timeline.length) {
         wrap.innerHTML = '<div class="subtle">No events recorded.</div>';
         return;
       }
 
-      // Build list of distinct event names
-      const names = Array.from(new Set(events.map(e => e.event || ''))).sort();
-      const options = ['(all)', ...names].map(n => `<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`).join('');
+      // Persist run id for toggle-driven refetches
+      window.__runState.runId = data.run_id;
 
+      // Build process dropdown options
+      const procSorted = [...processes].sort((a,b) => (a.pid||0) - (b.pid||0));
+      const procOptions = ['<option value="">(all processes)</option>'].concat(
+        procSorted.map(p => `<option value="${p.pid}">${p.pid} · ${escapeHtml(p.comm || 'unknown')}</option>`)
+      ).join('');
+
+      // Build stage dropdown options (scoped by pid if selected)
+      const pidFilter = window.__filters.pid;
+      const stageList = stages
+        .filter(s => !pidFilter || String(s.pid) === String(pidFilter))
+        .sort((a,b) => (a.pid-b.pid) || String(a.stage_id).localeCompare(String(b.stage_id)));
+
+      const stageOptions = ['<option value="">(all stages)</option>'].concat(
+        stageList.map(st => {
+          const label = `${st.stage_id}${st.exec_abs ? ' · ' + st.exec_abs.split('/').slice(-1)[0] : ''}`;
+          return `<option value="${escapeAttr(st.stage_id)}">${escapeHtml(label)}</option>`;
+        })
+      ).join('');
+
+      // Build list of distinct event names from current timeline
+      const names = Array.from(new Set(timeline.map(e => e.event || ''))).sort();
+      const typeOptions = ['(all)', ...names].map(n => `<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`).join('');
+
+      // Controls / layout
       wrap.innerHTML = `
         <div class="row cols3" style="margin-bottom:10px;">
           <div>
             <label>Search</label>
-            <input id="evt-search" placeholder="path / dst / event" oninput="filterEvents()" />
+            <input id="evt-search" placeholder="path / dst / label / json" oninput="filterEvents()" />
           </div>
           <div>
+            <label>Process</label>
+            <select id="evt-pid" onchange="setPidFilter(this.value)">${procOptions}</select>
+          </div>
+          <div>
+            <label>Stage</label>
+            <select id="evt-stage" onchange="setStageFilter(this.value)">${stageOptions}</select>
+          </div>
+        </div>
+
+        <div class="row cols3" style="margin-bottom:10px;">
+          <div>
             <label>Event type</label>
-            <select id="evt-type" onchange="filterEvents()">${options}</select>
+            <select id="evt-type" onchange="filterEvents()">${typeOptions}</select>
           </div>
           <div>
             <label>Quick toggles</label>
@@ -806,53 +869,210 @@
               <label class="pill"><input type="checkbox" id="evt-net" style="width:auto; margin-right:6px;" onchange="filterEvents()" />net-only</label>
             </div>
           </div>
+          <div>
+            <label>Noise controls (server)</label>
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+              <label class="pill"><input type="checkbox" id="opt-hide-mem" style="width:auto; margin-right:6px;" />hide mem</label>
+              <label class="pill"><input type="checkbox" id="opt-collapse-loader" style="width:auto; margin-right:6px;" />collapse loader</label>
+              <label class="pill"><input type="checkbox" id="opt-group-fd" style="width:auto; margin-right:6px;" />group reads</label>
+            </div>
+            <div class="subtle" style="margin-top:6px;">These re-fetch the run with different server-side compaction options.</div>
+          </div>
         </div>
+
         <div class="grid two">
           <div class="card" style="padding:14px;">
+            <h2>Process tree + stages</h2>
+            <div class="subtle">Click a process/stage to filter the timeline. These come from pid/ppid + derived stage_id boundaries.</div>
+            <div class="divider"></div>
+            <div class="row cols2">
+              <div>
+                <div class="subtle" style="margin-bottom:6px;">Process tree</div>
+                <div class="code mono" style="max-height: 200px;" id="proc-tree"></div>
+              </div>
+              <div>
+                <div class="subtle" style="margin-bottom:6px;">Stages</div>
+                <div style="max-height: 200px; overflow:auto;" id="stage-list"></div>
+              </div>
+            </div>
+
+            <div class="divider"></div>
+
             <h2>Timeline (ordered)</h2>
             <div class="subtle">Click any row to inspect full JSON event.</div>
             <div class="divider"></div>
-            <div style="max-height: 55vh; overflow:auto;">
+            <div style="max-height: 45vh; overflow:auto;">
               <table>
                 <thead>
                   <tr>
                     <th>#</th>
                     <th>ts_ms</th>
+                    <th>pid</th>
+                    <th>stage</th>
                     <th>event</th>
-                    <th>detail</th>
+                    <th>label</th>
                   </tr>
                 </thead>
                 <tbody id="evt-body"></tbody>
               </table>
             </div>
           </div>
+
           <div class="card" style="padding:14px;">
             <h2>Inspector</h2>
             <div class="subtle">Selected event JSON</div>
             <div class="divider"></div>
             <div class="code mono" id="evt-json">(select an event)</div>
+            <div class="divider"></div>
+            <button class="btn" onclick="downloadNdjson()">⬇️ Download raw events.ndjson</button>
           </div>
         </div>
       `;
 
+      // Wire server-side noise controls
+      const st = window.__runState;
+      const hideCb = document.getElementById('opt-hide-mem');
+      const collCb = document.getElementById('opt-collapse-loader');
+      const groupCb = document.getElementById('opt-group-fd');
+      hideCb.checked = !!st.opts.hide_mem;
+      collCb.checked = !!st.opts.collapse_loader;
+      groupCb.checked = !!st.opts.group_fd;
+
+      function _onOptChange() {
+        st.opts.hide_mem = !!hideCb.checked;
+        st.opts.collapse_loader = !!collCb.checked;
+        st.opts.group_fd = !!groupCb.checked;
+        refetchRunWithOpts().catch(e => toast('Refetch failed: ' + e.message, 'bad'));
+      }
+      hideCb.onchange = _onOptChange;
+      collCb.onchange = _onOptChange;
+      groupCb.onchange = _onOptChange;
+
+      window.__lastProcTree = procTree;
+      window.__lastStages = stageList;
+
+      // Render process tree + stages
+      renderProcessTree(procTree);
+      renderStages(stageList);
+
       // Store for filtering
-      window.__events = events;
-      filterEvents();
-      selectEvent(0);
+      window.__events = timeline;
+
+      // Apply persisted filters to dropdowns
+      document.getElementById('evt-pid').value = (window.__filters.pid ?? '') === null ? '' : String(window.__filters.pid ?? '');
+      document.getElementById('evt-stage').value = (window.__filters.stage_id ?? '') === null ? '' : String(window.__filters.stage_id ?? '');
+
+      // Initial render
+      const filtered = filterEvents();
+      if (filtered.length) selectEvent(filtered[0].idx ?? filtered[0].ts_ms ?? 0);
+      else selectEvent((timeline[0].idx ?? 0));
     }
 
-    function eventDetail(ev) {
+    function downloadNdjson() {
+      const st = window.__runState;
+      if (!st.runId) return;
+      window.open(`/api/run/${encodeURIComponent(st.runId)}/events`, '_blank');
+    }
+
+    function setPidFilter(pid) {
+      window.__filters.pid = pid ? parseInt(pid, 10) : null;
+      window.__filters.stage_id = null; // reset stage when switching pid
+      refreshStageOptions();
+      // Sync UI if present
+      const stageSel = document.getElementById('evt-stage');
+      if (stageSel) stageSel.value = '';
+      filterEvents();
+    }
+
+    function setStageFilter(stageId) {
+      window.__filters.stage_id = stageId ? String(stageId) : null;
+      filterEvents();
+    }
+function refreshStageOptions() {
+      const stageSel = document.getElementById('evt-stage');
+      if (!stageSel) return;
+      const pidFilter = window.__filters.pid;
+      const stages = window.__lastStages || [];
+      const stageList = stages
+        .filter(s => !pidFilter || String(s.pid) === String(pidFilter))
+        .sort((a,b) => (a.pid-b.pid) || String(a.stage_id).localeCompare(String(b.stage_id)));
+
+      const opts = ['<option value="">(all stages)</option>'].concat(
+        stageList.map(st => {
+          const label = `${st.stage_id}${st.exec_abs ? ' · ' + st.exec_abs.split('/').slice(-1)[0] : ''}`;
+          return `<option value="${escapeAttr(st.stage_id)}">${escapeHtml(label)}</option>`;
+        })
+      ).join('');
+      stageSel.innerHTML = opts;
+    }
+
+
+    function renderProcessTree(procTree) {
+      const el = document.getElementById('proc-tree');
+      if (!el) return;
+      if (!procTree || !procTree.length) {
+        el.textContent = '(no process tree data)';
+        return;
+      }
+      el.innerHTML = _procTreeToHtml(procTree, 0);
+    }
+
+    function _procTreeToHtml(nodes, depth) {
+      return (nodes || []).map(n => {
+        const pid = n.pid;
+        const comm = n.comm || 'unknown';
+        const active = (window.__filters.pid !== null && String(window.__filters.pid) === String(pid));
+        const pad = ' '.repeat(depth * 2);
+        const line = `${pad}${pid} ${comm}`;
+        const btn = `<div class="evt" style="padding:4px 6px; border-radius:10px; ${active ? 'background: rgba(0,212,255,0.10); border: 1px solid rgba(0,212,255,0.25);' : ''}" onclick="setPidFilter('${pid}'); document.getElementById('evt-pid').value='${pid}'; filterEvents();">${escapeHtml(line)}</div>`;
+        const kids = (n.children && n.children.length) ? _procTreeToHtml(n.children, depth + 1) : '';
+        return btn + kids;
+      }).join('');
+    }
+
+    function renderStages(stages) {
+      const el = document.getElementById('stage-list');
+      if (!el) return;
+      if (!stages || !stages.length) {
+        el.innerHTML = '<div class="subtle">(no stage data)</div>';
+        return;
+      }
+
+      // Group by pid for readability
+      const byPid = {};
+      for (const s of stages) {
+        const pid = s.pid ?? -1;
+        if (window.__filters.pid && String(pid) !== String(window.__filters.pid)) continue;
+        (byPid[pid] = byPid[pid] || []).push(s);
+      }
+      const pids = Object.keys(byPid).map(x => parseInt(x, 10)).sort((a,b) => a-b);
+
+      let html = '';
+      for (const pid of pids) {
+        html += `<div class="subtle" style="margin: 6px 0;">pid ${pid}</div>`;
+        html += `<div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">`;
+        for (const st of byPid[pid]) {
+          const active = (window.__filters.stage_id && String(window.__filters.stage_id) === String(st.stage_id));
+          const label = (st.exec_abs ? st.exec_abs.split('/').slice(-1)[0] : st.stage_id);
+          html += `<button class="inner-tab ${active ? 'active' : ''}" style="cursor:pointer;" onclick="setPidFilter('${pid}'); document.getElementById('evt-pid').value='${pid}'; setStageFilter('${escapeAttr(st.stage_id)}'); document.getElementById('evt-stage').value='${escapeAttr(st.stage_id)}'; filterEvents();">${escapeHtml(label)}</button>`;
+        }
+        html += `</div>`;
+      }
+      el.innerHTML = html || '<div class="subtle">(no stages match current filter)</div>';
+    }
+
+    function eventLabel(ev) {
+      if (!ev) return '';
+      if (ev.label) return String(ev.label);
+      // fallback: previous heuristic
       const keys = ['abs','path','dst','old','new','why','fd','len','flags','addr','cmd'];
       for (const k of keys) {
         if (ev[k] !== undefined) return `${k}=${ev[k]}`;
       }
-      // fallback: show a compact subset
       const clone = {...ev};
-      delete clone.idx;
-      delete clone.ts_ms;
-      delete clone.event;
+      delete clone.idx; delete clone.ts_ms; delete clone.event;
       const s = JSON.stringify(clone);
-      return s.length > 80 ? (s.slice(0, 77) + '…') : s;
+      return s.length > 90 ? (s.slice(0, 87) + '…') : s;
     }
 
     function filterEvents() {
@@ -861,12 +1081,19 @@
       const policyOnly = document.getElementById('evt-policy').checked;
       const netOnly = document.getElementById('evt-net').checked;
 
+      const pidFilter = window.__filters.pid;
+      const stageFilter = window.__filters.stage_id;
+
       const evs = window.__events || [];
       const tbody = document.getElementById('evt-body');
 
       const filtered = evs.filter(ev => {
         const et = String(ev.event || '');
         if (t && t !== '(all)' && et !== t) return false;
+
+        if (pidFilter !== null && String(ev.pid) !== String(pidFilter)) return false;
+        if (stageFilter !== null && String(ev.stage_id || '') !== String(stageFilter)) return false;
+
         if (policyOnly) {
           const e = et.toLowerCase();
           if (!(e.startsWith('tripwire') || ['hard_kill','snapshot','timeout_halt','max_events_halt'].includes(e))) return false;
@@ -875,29 +1102,39 @@
           if (!String(et).toLowerCase().startsWith('net_')) return false;
         }
         if (!q) return true;
-        const blob = JSON.stringify(ev).toLowerCase();
+        const blob = (eventLabel(ev) + ' ' + JSON.stringify(ev)).toLowerCase();
         return blob.includes(q);
       });
 
       tbody.innerHTML = '';
-      filtered.slice(0, 3000).forEach(ev => {
+      filtered.slice(0, 4000).forEach(ev => {
         const tr = document.createElement('tr');
         tr.className = 'evt';
         tr.onclick = () => selectEvent(ev.idx ?? 0);
         tr.innerHTML = `
           <td class="mono">${ev.idx ?? ''}</td>
           <td class="mono">${escapeHtml(String(ev.ts_ms ?? ''))}</td>
+          <td class="mono">${escapeHtml(String(ev.pid ?? ''))} ${escapeHtml(ev.comm ? ('· ' + ev.comm) : '')}</td>
+          <td class="mono">${escapeHtml(String(ev.stage_id ?? ''))}</td>
           <td class="mono">${escapeHtml(String(ev.event || ''))}</td>
-          <td>${escapeHtml(eventDetail(ev))}</td>
+          <td>${escapeHtml(eventLabel(ev))}</td>
         `;
         tbody.appendChild(tr);
       });
+
+      // Re-render highlights for tree/stage
+      try {
+        renderProcessTree(window.__lastProcTree || []);
+      } catch (_) {}
+
+      return filtered;
     }
 
     function selectEvent(idx) {
       const evs = window.__events || [];
       const ev = evs.find(e => (e.idx ?? 0) === idx) || evs[0];
-      document.getElementById('evt-json').textContent = JSON.stringify(ev, null, 2);
+      const out = document.getElementById('evt-json');
+      if (out) out.textContent = JSON.stringify(ev, null, 2);
     }
 
     function renderArtifacts(data) {

@@ -9,6 +9,7 @@ This server intentionally stays thin:
 from flask import Flask, request, jsonify, send_file
 from pathlib import Path
 import json
+import re
 import subprocess
 import time
 import sys
@@ -49,6 +50,323 @@ def _safe_read_json(path: Path, default=None):
     except Exception:
         return default
 
+
+# ---------- Event loading + light UI joins (pid tree / stages / friendly labels) ----------
+
+def _iter_events_ndjson(path: Path, max_events: int | None = None):
+    """Stream NDJSON events; tolerates partial/corrupt lines."""
+    n = 0
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            if max_events is not None and n >= max_events:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+                n += 1
+            except Exception:
+                continue
+
+
+def load_run_events(run_dir: Path, max_events: int | None = None):
+    """Prefer events.ndjson (newer, streaming-friendly). Fall back to report.json events."""
+    nd = run_dir / "events.ndjson"
+    if nd.exists():
+        return list(_iter_events_ndjson(nd, max_events=max_events))
+    rp = run_dir / "report.json"
+    if rp.exists():
+        rj = _safe_read_json(rp, default={}) or {}
+        evs = rj.get("events", []) or []
+        if max_events is not None:
+            evs = evs[:max_events]
+        return evs
+    return []
+
+
+_LOADER_PATH_RE = re.compile(
+    r"(^|/)(ld-linux|ld-[^/]*\.so|ld\.so\.cache|libc\.so|libpthread\.so|libm\.so|libdl\.so|libstdc\+\+\.so)",
+    re.IGNORECASE,
+)
+
+def _is_loaderish_path(p: str) -> bool:
+    if not p:
+        return False
+    # Cheap heuristic: libc/ld + any /lib or /usr/lib are usually loader noise.
+    if _LOADER_PATH_RE.search(p):
+        return True
+    if "/lib/" in p or p.startswith("/lib") or "/usr/lib/" in p:
+        return True
+    if p.startswith("/etc/ld.so"):
+        return True
+    return False
+
+
+def _decode_open_flags(flags: int | None) -> str:
+    if flags is None:
+        return ""
+    try:
+        flags = int(flags)
+    except Exception:
+        return ""
+    # POSIX: access mode is low 2 bits (0=RDONLY, 1=WRONLY, 2=RDWR)
+    acc = flags & 0x3
+    mode = {0: "r", 1: "w", 2: "rw"}.get(acc, "?")
+    tags = []
+    # Common Linux bits (not exhaustive)
+    if flags & 0x40:      # O_CREAT
+        tags.append("creat")
+    if flags & 0x200:     # O_TRUNC
+        tags.append("trunc")
+    if flags & 0x400:     # O_APPEND
+        tags.append("append")
+    if flags & 0x80000:   # O_CLOEXEC
+        tags.append("cloexec")
+    return mode + (("+" + "+".join(tags)) if tags else "")
+
+
+def add_stage_ids(events: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Derive stage_id from exec boundaries (cheap + deterministic).
+
+    stage_id format: "<pid>:<exec_seq>" where exec_seq increments after exec_allow*.
+    """
+    stage_seq: dict[int, int] = {}
+    stages: dict[str, dict] = {}
+
+    # Ensure deterministic order
+    events_sorted = sorted(events, key=lambda e: int(e.get("idx", 0)))
+
+    for ev in events_sorted:
+        pid = int(ev.get("pid", -1))
+        if pid < 0:
+            continue
+
+        seq = stage_seq.get(pid, 0)
+        sid = f"{pid}:{seq}"
+        ev["stage_id"] = sid
+
+        # Stage record (created on first touch)
+        if sid not in stages:
+            stages[sid] = {
+                "stage_id": sid,
+                "pid": pid,
+                "ppid": ev.get("ppid"),
+                "comm": ev.get("comm"),
+                "start_idx": ev.get("idx"),
+                "start_ts_ms": ev.get("ts_ms"),
+                "exec_abs": None,      # filled when we see exec_allow*
+                "exec_path": None,
+            }
+
+        # If the process just exec'd, bump the stage *after* this event
+        et = str(ev.get("event", ""))
+        if et.startswith("exec_allow") or et in ("exec_commit",):
+            stages[sid]["exec_abs"] = ev.get("abs")
+            stages[sid]["exec_path"] = ev.get("path")
+            stage_seq[pid] = seq + 1
+
+    # Fixup: propagate comm updates (comm can change after exec)
+    for ev in events_sorted:
+        sid = ev.get("stage_id")
+        if sid in stages and ev.get("comm"):
+            stages[sid]["comm"] = ev.get("comm")
+
+    return events_sorted, list(stages.values())
+
+
+def build_process_index(events: list[dict], stages: list[dict]):
+    """Build a minimal process table + parent/child edges for UI."""
+    procs: dict[int, dict] = {}
+    for ev in events:
+        pid = int(ev.get("pid", -1))
+        if pid < 0:
+            continue
+        p = procs.setdefault(pid, {
+            "pid": pid,
+            "ppid": ev.get("ppid"),
+            "comm": ev.get("comm"),
+            "first_idx": ev.get("idx"),
+            "last_idx": ev.get("idx"),
+            "first_ts_ms": ev.get("ts_ms"),
+            "last_ts_ms": ev.get("ts_ms"),
+            "exec_chain": [],
+            "children": [],
+        })
+        # Update rolling facts
+        p["ppid"] = ev.get("ppid", p["ppid"])
+        if ev.get("comm"):
+            p["comm"] = ev.get("comm")
+        p["last_idx"] = ev.get("idx", p["last_idx"])
+        p["last_ts_ms"] = ev.get("ts_ms", p["last_ts_ms"])
+
+        et = str(ev.get("event", ""))
+        if et.startswith("exec_allow") and ev.get("abs"):
+            p["exec_chain"].append(ev.get("abs"))
+
+    # Edges
+    for pid, p in procs.items():
+        ppid = p.get("ppid")
+        if isinstance(ppid, int) and ppid in procs and ppid != pid:
+            procs[ppid]["children"].append(pid)
+
+    # Roots (ppid not in table)
+    roots = [pid for pid, p in procs.items() if not (isinstance(p.get("ppid"), int) and p["ppid"] in procs and p["ppid"] != pid)]
+    roots.sort()
+
+    def _to_tree(pid: int):
+        node = dict(procs[pid])
+        node["children"] = [ _to_tree(c) for c in sorted(node.get("children", [])) ]
+        return node
+
+    tree = [ _to_tree(r) for r in roots ]
+    return list(procs.values()), tree
+
+
+def _friendly_label(ev: dict) -> str:
+    et = str(ev.get("event", ""))
+    pid = ev.get("pid")
+    # Synthetic rows
+    if et == "fs_loader_group":
+        return f"loader: {ev.get('count', 0)} library/ld opens (collapsed)"
+    if et == "fd_read_group":
+        return f"read: fd={ev.get('fd')} x{ev.get('count', 0)} ({ev.get('bytes', 0)} bytes)"
+
+    if et == "fs_open_attempt":
+        abs_p = ev.get("abs") or ev.get("path") or ""
+        flags = _decode_open_flags(ev.get("flags"))
+        tail = abs_p.split("/")[-1] if abs_p else ""
+        return f"open({flags}) {tail or abs_p}"
+    if et.startswith("fs_open_write_allowed"):
+        abs_p = ev.get("abs") or ""
+        tail = abs_p.split("/")[-1] if abs_p else abs_p
+        return f"open(write allowed) {tail}"
+    if et.startswith("fs_unlink"):
+        abs_p = ev.get("abs") or ev.get("path") or ""
+        return f"unlink {abs_p}"
+    if et.startswith("exec_attempt"):
+        abs_p = ev.get("abs") or ev.get("path") or ""
+        return f"exec? {abs_p}"
+    if et.startswith("exec_allow"):
+        abs_p = ev.get("abs") or ""
+        return f"exec ✓ {abs_p}"
+    if et == "proc_fork_attempt":
+        return f"fork/clone?"
+    if et == "net_connect_attempt":
+        return f"connect {ev.get('dst', '')} (fd={ev.get('fd')})"
+    if et == "net_sendto_attempt":
+        return f"sendto {ev.get('dst', '')} len={ev.get('len')}"
+    if et == "net_attempt":
+        return f"net syscall {ev.get('sys')}"
+    if et == "mprotect":
+        return f"mprotect prot={ev.get('prot')} adds_exec={bool(ev.get('adds_exec'))}"
+    if et.startswith("fd_"):
+        fd = ev.get("fd")
+        if et == "fd_read":
+            return f"read fd={fd} ({ev.get('count')} bytes)"
+        if et == "fd_close":
+            return f"close fd={fd}"
+        return f"{et} fd={fd}"
+    return et
+
+
+def build_compact_timeline(events: list[dict], *, hide_mem_noise: bool = True, collapse_loader: bool = True, group_fd_reads: bool = True):
+    """Return a UI-friendly timeline with basic noise controls and friendly labels.
+
+    This is still 'thin': no guessing, only grouping consecutive identical-ish rows.
+    """
+    out = []
+    i = 0
+    n = len(events)
+
+    while i < n:
+        ev = events[i]
+        et = str(ev.get("event", ""))
+
+        # 1) Hide mprotect unless adds_exec=true
+        if hide_mem_noise and et == "mprotect" and not bool(ev.get("adds_exec", False)):
+            i += 1
+            continue
+
+        # 2) Collapse consecutive loader/library opens
+        if collapse_loader and et == "fs_open_attempt" and _is_loaderish_path(str(ev.get("abs", ""))):
+            j = i
+            sample_paths = []
+            while j < n:
+                ev2 = events[j]
+                if str(ev2.get("event","")) != "fs_open_attempt":
+                    break
+                if not _is_loaderish_path(str(ev2.get("abs", ""))):
+                    break
+                # Keep within same pid+stage for sanity
+                if ev2.get("pid") != ev.get("pid") or ev2.get("stage_id") != ev.get("stage_id"):
+                    break
+                if len(sample_paths) < 3 and ev2.get("abs"):
+                    sample_paths.append(ev2.get("abs"))
+                j += 1
+            count = j - i
+            if count >= 4:  # only worth collapsing if it's real noise
+                synthetic = {
+                    "ts_ms": ev.get("ts_ms"),
+                    "idx": ev.get("idx"),
+                    "event": "fs_loader_group",
+                    "pid": ev.get("pid"),
+                    "tid": ev.get("tid"),
+                    "ppid": ev.get("ppid"),
+                    "comm": ev.get("comm"),
+                    "stage_id": ev.get("stage_id"),
+                    "count": count,
+                    "samples": sample_paths,
+                }
+                synthetic["label"] = _friendly_label(synthetic)
+                out.append(synthetic)
+                i = j
+                continue
+
+        # 3) Group consecutive fd_read on same fd
+        if group_fd_reads and et == "fd_read":
+            fd = ev.get("fd")
+            j = i
+            total = 0
+            while j < n:
+                ev2 = events[j]
+                if str(ev2.get("event","")) != "fd_read":
+                    break
+                if ev2.get("pid") != ev.get("pid") or ev2.get("stage_id") != ev.get("stage_id"):
+                    break
+                if ev2.get("fd") != fd:
+                    break
+                try:
+                    total += int(ev2.get("count", 0))
+                except Exception:
+                    pass
+                j += 1
+            count = j - i
+            if count >= 4:
+                synthetic = {
+                    "ts_ms": ev.get("ts_ms"),
+                    "idx": ev.get("idx"),
+                    "event": "fd_read_group",
+                    "pid": ev.get("pid"),
+                    "tid": ev.get("tid"),
+                    "ppid": ev.get("ppid"),
+                    "comm": ev.get("comm"),
+                    "stage_id": ev.get("stage_id"),
+                    "fd": fd,
+                    "count": count,
+                    "bytes": total,
+                }
+                synthetic["label"] = _friendly_label(synthetic)
+                out.append(synthetic)
+                i = j
+                continue
+
+        ev = dict(ev)
+        ev["label"] = _friendly_label(ev)
+        out.append(ev)
+        i += 1
+
+    return out
 
 def get_all_runs():
     runs = []
@@ -178,20 +496,48 @@ def api_runs():
 
 @app.route('/api/run/<run_id>')
 def api_run_detail(run_id):
-    """Get detailed information for a specific run"""
-    run_dir = RUNS_DIR / run_id
-    report_path = run_dir / "report.json"
+    """Get detailed information for a specific run.
 
-    if not report_path.exists():
+    Notes:
+    - We prefer events.ndjson because it contains pid/tid/ppid/comm envelopes and is streaming-friendly.
+    - report.json is still used for meta (cmdline, mode, write_dir, etc.) when available.
+    """
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
         return jsonify({'error': 'Run not found'}), 404
 
-    report = _safe_read_json(report_path, default=None)
-    if report is None:
-        return jsonify({'error': 'Failed to parse report.json'}), 500
+    # Optional UI controls
+    try:
+        max_events = int(request.args.get("max_events")) if request.args.get("max_events") else None
+    except Exception:
+        max_events = None
 
-    meta = report.get("meta", {}) or {}
-    events = report.get("events", []) or []
-    categorized = parse_events(events)
+    include_raw = request.args.get("raw", "0") == "1"
+    hide_mem_noise = request.args.get("hide_mem", "1") == "1"
+    collapse_loader = request.args.get("collapse_loader", "1") == "1"
+    group_fd_reads = request.args.get("group_fd", "1") == "1"
+
+    report_path = run_dir / "report.json"
+    report = _safe_read_json(report_path, default={}) if report_path.exists() else {}
+    meta = (report.get("meta", {}) or {}) if isinstance(report, dict) else {}
+
+    # Load events (ndjson preferred)
+    raw_events = load_run_events(run_dir, max_events=max_events)
+
+    # Derive stage_id + process tree
+    events, stages = add_stage_ids(raw_events)
+    processes, proc_tree = build_process_index(events, stages)
+
+    # Build a compact timeline for the UI
+    timeline = build_compact_timeline(
+        events,
+        hide_mem_noise=hide_mem_noise,
+        collapse_loader=collapse_loader,
+        group_fd_reads=group_fd_reads,
+    )
+
+    # Re-use existing categorizer for convenience
+    categorized = parse_events(timeline)
 
     # Files created inside the write jail typically live at outdir/fs
     fs_dir = run_dir / "fs"
@@ -214,36 +560,58 @@ def api_run_detail(run_id):
                 "size": p.stat().st_size,
             })
 
-    sockmap = None
-    sockmap_path = run_dir / "dump_sockmap.json"
-    if sockmap_path.exists():
-        sockmap = _safe_read_json(sockmap_path, default=None)
+    # sockmap is optional; leave as-is if present
+    sockmap_path = run_dir / "sockmap.json"
+    sockmap = _safe_read_json(sockmap_path, default=None) if sockmap_path.exists() else None
 
-    # Derived summary for quick UI badges
     def _count(prefix: str) -> int:
         return sum(1 for ev in events if str(ev.get("event", "")).startswith(prefix))
 
     summary = {
         "event_count": len(events),
+        "timeline_count": len(timeline),
         "fs": _count("fs_"),
         "net": _count("net_"),
-        "proc": _count("proc_") + sum(1 for ev in events if str(ev.get("event","" )).startswith("exec")),
-        "mprotect": sum(1 for ev in events if "mprotect" in str(ev.get("event", ""))),
-        "policy": sum(1 for ev in events if str(ev.get("event", "")).startswith("tripwire") or str(ev.get("event", "")) in ("hard_kill","snapshot","timeout_halt","max_events_halt")),
+        "proc": _count("proc_") + sum(1 for ev in events if str(ev.get("event", "")).startswith("exec")),
+        "mprotect": sum(1 for ev in events if str(ev.get("event", "")) == "mprotect"),
+        "policy": sum(1 for ev in events if str(ev.get("event", "")) in ("hard_kill","snapshot","timeout_halt","max_events_halt")),
         "drops": sum(1 for ev in events if str(ev.get("event", "")) in ("drop_mark", "exec_denied_drop")),
     }
 
-    return jsonify({
+    resp = {
         'report': report,
         'meta': meta,
+        'summary': summary,
         'categorized_events': categorized,
+        'timeline': timeline,
+        'stages': stages,
+        'processes': processes,
+        'process_tree': proc_tree,
         'artifacts': artifacts,
         'snapshots': snapshots,
         'sockmap': sockmap,
-        'summary': summary,
         'run_id': run_id,
-    })
+    }
 
+    if include_raw:
+        resp["events_raw"] = events
+
+    return jsonify(resp)
+
+
+@app.route('/api/run/<run_id>/events')
+def api_run_events(run_id):
+    """Stream raw events.ndjson if available (fallback: report.json events as JSON)."""
+    run_dir = RUNS_DIR / run_id
+    nd = run_dir / "events.ndjson"
+    if nd.exists():
+        # Send as a file to keep it cheap (client can parse NDJSON progressively)
+        return send_file(str(nd), mimetype="application/x-ndjson")
+    rp = run_dir / "report.json"
+    if rp.exists():
+        report = _safe_read_json(rp, default={}) or {}
+        return jsonify(report.get("events", []) or [])
+    return jsonify({'error': 'Run not found'}), 404
 
 @app.route('/api/run/<run_id>/artifact/<path:artifact_path>')
 def api_download_artifact(run_id, artifact_path):
@@ -539,4 +907,3 @@ if __name__ == '__main__':
     print(f"[SoftRX Web] SOFTRXCTL exists: {SOFTRXCTL.exists()}", file=sys.stderr)
 
     app.run(debug=True, host='0.0.0.0', port=5000)
-
