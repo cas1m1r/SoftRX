@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SoftRX — Sandbox Control Plane</title>
   <style>
     :root {
@@ -241,12 +241,12 @@
           <div class="row cols2">
             <div>
               <label>Sample</label>
-              <select id="sample-select"><option>Loading...</option></select>
+              <select id="sample-select"><option selected="selected">Loading...</option></select>
               <div class="subtle" style="margin-top:6px;">Uploads are stored in <span class="mono" id="uploads-dir">uploads/</span></div>
             </div>
             <div>
               <label>Sample arguments</label>
-              <input id="sample-args" placeholder="arg1 arg2 ..." />
+              <input id="sample-args" placeholder="arg1 arg2 ...">
               <div class="subtle" style="margin-top:6px;">Split on spaces. Quote handling is minimal (intentionally).</div>
             </div>
           </div>
@@ -257,7 +257,7 @@
             <div>
               <label>Mode</label>
               <select id="mode">
-                <option value="malware">malware (strict)</option>
+                <option value="malware" selected="selected">malware (strict)</option>
                 <option value="re">re (operator-friendly)</option>
                 <option value="reveal-net">reveal-net (show net attempts, cap sends)</option>
                 <option value="dev">dev (max visibility)</option>
@@ -265,11 +265,11 @@
             </div>
             <div>
               <label>Timeout (ms)</label>
-              <input type="number" id="timeout-ms" value="4000" min="100" step="100" />
+              <input type="number" id="timeout-ms" value="4000" min="100" step="100">
             </div>
             <div>
               <label>Max events</label>
-              <input type="number" id="max-events" value="2000" min="1" step="50" />
+              <input type="number" id="max-events" value="2000" min="1" step="50">
             </div>
           </div>
 
@@ -284,14 +284,14 @@
               <div class="row cols2">
                 <div>
                   <label>Write jail (optional)</label>
-                  <input id="write-jail" placeholder="(blank = default outdir/fs for malware/re, backend decides)" />
+                  <input id="write-jail" placeholder="(blank = default outdir/fs for malware/re, backend decides)">
                   <div class="subtle" style="margin-top:6px;">If blank: malware/re default to <span class="mono">outdir/fs</span>. Reveal-net ignores writes. Dev auto-picks <span class="mono">outdir/fs</span>.</div>
                 </div>
                 <div>
                   <label>Policy toggles</label>
                   <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                    <label class="pill"><input type="checkbox" id="quarantine" checked style="width:auto; margin-right:6px;" />quarantine drops</label>
-                    <label class="pill"><input type="checkbox" id="interactive-fs" style="width:auto; margin-right:6px;" />interactive-fs</label>
+                    <label class="pill"><input type="checkbox" id="quarantine" checked="checked" style="width:auto; margin-right:6px;">quarantine drops</label>
+                    <label class="pill"><input type="checkbox" id="interactive-fs" style="width:auto; margin-right:6px;">interactive-fs</label>
                   </div>
                   <div class="subtle" style="margin-top:6px;">Quarantine prevents executing newly written (tainted) files. Interactive-fs prompts on writes inside jail (terminal required).</div>
                 </div>
@@ -308,9 +308,9 @@
             </button>
             <div class="body">
               <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
-                <label class="pill"><input type="checkbox" id="allow-dns" checked style="width:auto; margin-right:6px;" />allow DNS (53)</label>
-                <label class="pill"><input type="checkbox" id="allow-dot" checked style="width:auto; margin-right:6px;" />allow DoT (853)</label>
-                <label class="pill"><input type="checkbox" id="deny-unlisted" style="width:auto; margin-right:6px;" />deny-unlisted</label>
+                <label class="pill"><input type="checkbox" id="allow-dns" checked="checked" style="width:auto; margin-right:6px;">allow DNS (53)</label>
+                <label class="pill"><input type="checkbox" id="allow-dot" checked="checked" style="width:auto; margin-right:6px;">allow DoT (853)</label>
+                <label class="pill"><input type="checkbox" id="deny-unlisted" style="width:auto; margin-right:6px;">deny-unlisted</label>
               </div>
 
               <div class="row cols2">
@@ -324,15 +324,15 @@
                   <div class="row cols3">
                     <div>
                       <label>bytes</label>
-                      <input type="number" id="net-cap-bytes" value="10240" min="0" step="256" />
+                      <input type="number" id="net-cap-bytes" value="10240" min="0" step="256">
                     </div>
                     <div>
                       <label>ms</label>
-                      <input type="number" id="net-cap-ms" value="2000" min="0" step="250" />
+                      <input type="number" id="net-cap-ms" value="2000" min="0" step="250">
                     </div>
                     <div>
                       <label>sends</label>
-                      <input type="number" id="net-cap-sends" value="32" min="0" step="1" />
+                      <input type="number" id="net-cap-sends" value="32" min="0" step="1">
                     </div>
                   </div>
                   <div class="subtle" style="margin-top:6px;">Set to 0 to disable a cap. Caps are enforced by the C backend. Socket stats are dumped in <span class="mono">dump_sockmap.json</span> on snapshot.</div>
@@ -352,11 +352,11 @@
               <div class="row cols2">
                 <div>
                   <label>Launcher path</label>
-                  <input id="launcher" placeholder="bin/softrx_launcher" />
+                  <input id="launcher" placeholder="bin/softrx_launcher">
                 </div>
                 <div>
                   <label>Runs dir</label>
-                  <input id="runs-dir" placeholder="softrx_runs" />
+                  <input id="runs-dir" placeholder="softrx_runs">
                 </div>
               </div>
             </div>
@@ -389,12 +389,12 @@
         <div class="row cols2" style="margin-bottom: 12px;">
           <div>
             <label>Search (sample / run id)</label>
-            <input id="run-search" placeholder="type to filter" oninput="renderRuns()" />
+            <input id="run-search" placeholder="type to filter" oninput="renderRuns()">
           </div>
           <div>
             <label>Mode filter</label>
             <select id="mode-filter" onchange="renderRuns()">
-              <option value="">(all)</option>
+              <option value="" selected="selected">(all)</option>
               <option value="malware">malware</option>
               <option value="re">re</option>
               <option value="reveal-net">reveal-net</option>
@@ -415,7 +415,7 @@
         <h2>Upload sample</h2>
         <div class="subtle">Files are saved to the server upload directory and auto-marked executable.</div>
         <div class="divider"></div>
-        <input type="file" id="file-input" />
+        <input type="file" id="file-input">
         <div style="height:10px"></div>
         <button class="btn primary" onclick="uploadFile()">⬆️ Upload</button>
         <div id="upload-result" class="subtle" style="margin-top: 10px;"></div>
@@ -449,7 +449,7 @@
     </div>
   </div>
 
-  <div class="toast" id="toast"></div>
+  <div class="toast" id="toast">Debug failed: JSON.parse: unexpected character at line 1 column 1 of the JSON data</div>
 
   <script>
     let config = null;
@@ -1266,5 +1266,5 @@ function refreshStageOptions() {
       loadDebug();
     });
   </script>
-</body>
-</html>
+
+</body></html>

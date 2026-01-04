@@ -18,7 +18,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
 #include <string.h>
 
 #include <sys/socket.h>  // msghdr/cmsghdr, CMSG_*, SCM_RIGHTS, SOL_SOCKET, socketpair
@@ -309,28 +308,6 @@ typedef struct taint_node_t {
     struct taint_node_t *next;
 } taint_node_t;
 
-// -------- fd -> target mapping (best-effort, for friendly labels) --------
-typedef struct fd_map_ent_t {
-    pid_t tid;               // thread id from USER_NOTIF (also pid in /proc)
-    int   fd;
-    char  target[PATH_MAX];  // readlink(/proc/<tid>/fd/<fd>)
-} fd_map_ent_t;
-
-// -------- fork/clone correlation (best-effort) --------
-// With SECCOMP_USER_NOTIF + CONTINUE, we don't get the fork/clone return value.
-// Instead we correlate a recent proc_fork_attempt from parent_pid with the first
-// time we observe a new pid whose ppid == parent_pid.
-typedef struct fork_pending_t {
-    pid_t parent_pid;        // parent tgid
-    uint64_t attempt_idx;     // event idx of proc_fork_attempt
-    uint64_t attempt_ts_ms;   // timestamp when attempt was observed
-    char sys[8];              // "fork","vfork","clone","clone3"
-    bool used;                // matched to a child already
-} fork_pending_t;
-
-
-
-
 typedef struct {
     pid_t tracee;
     pid_t tracee_pgid;
@@ -371,23 +348,7 @@ typedef struct {
     struct sock_track_t socks[512];
     int sock_count;
 
-    
-    // FD -> target cache (for labeling reads/writes/closes). Populated lazily via /proc/<tid>/fd/<fd>.
-    fd_map_ent_t *fdmap;
-    size_t fdmap_len;
-    size_t fdmap_cap;
-
-
-    // Process tracking (best-effort): emit proc_seen once per pid; correlate fork->child_pid.
-    pid_t *seen_pids;
-    size_t seen_pids_len;
-    size_t seen_pids_cap;
-
-    fork_pending_t *fork_pending;
-    size_t fork_pending_len;
-    size_t fork_pending_cap;
-
-// Quarantine: prevent executing newly written (dropped) files while still tracing.
+    // Quarantine: prevent executing newly written (dropped) files while still tracing.
     bool quarantine_drops;
     taint_node_t *tainted_paths;
 } supervisor_ctx_t;
@@ -601,7 +562,7 @@ static void cache_proc_identity(supervisor_ctx_t *c, pid_t tid) {
     fclose(fp);
 }
 
-static uint64_t emit_evt(supervisor_ctx_t *c, const char *event, const char *fmt, ...) {
+static void emit_evt(supervisor_ctx_t *c, const char *event, const char *fmt, ...) {
     uint64_t ts = now_ms();
     uint64_t idx = c->evt_idx++;
 
@@ -636,164 +597,7 @@ static uint64_t emit_evt(supervisor_ctx_t *c, const char *event, const char *fmt
     }
     fprintf(c->events_fp, "}\n");
     fflush(c->events_fp);
-    return idx;
 }
-
-static bool seen_pid_has(supervisor_ctx_t *c, pid_t pid) {
-    for (size_t i = 0; i < c->seen_pids_len; i++) {
-        if (c->seen_pids[i] == pid) return true;
-    }
-    return false;
-}
-
-static void seen_pid_add(supervisor_ctx_t *c, pid_t pid) {
-    if (pid <= 0) return;
-    if (seen_pid_has(c, pid)) return;
-    if (c->seen_pids_len + 1 > c->seen_pids_cap) {
-        size_t new_cap = c->seen_pids_cap ? (c->seen_pids_cap * 2) : 128;
-        pid_t *np = (pid_t*)realloc(c->seen_pids, new_cap * sizeof(pid_t));
-        if (!np) return;
-        c->seen_pids = np;
-        c->seen_pids_cap = new_cap;
-    }
-    c->seen_pids[c->seen_pids_len++] = pid;
-}
-
-static void fork_pending_add(supervisor_ctx_t *c, pid_t parent_pid, uint64_t attempt_idx, const char *sys, uint64_t ts_ms) {
-    if (parent_pid <= 0) return;
-    if (c->fork_pending_len + 1 > c->fork_pending_cap) {
-        size_t new_cap = c->fork_pending_cap ? (c->fork_pending_cap * 2) : 64;
-        fork_pending_t *np = (fork_pending_t*)realloc(c->fork_pending, new_cap * sizeof(fork_pending_t));
-        if (!np) return;
-        c->fork_pending = np;
-        c->fork_pending_cap = new_cap;
-    }
-    fork_pending_t *fp = &c->fork_pending[c->fork_pending_len++];
-    memset(fp, 0, sizeof(*fp));
-    fp->parent_pid = parent_pid;
-    fp->attempt_idx = attempt_idx;
-    fp->attempt_ts_ms = ts_ms;
-    snprintf(fp->sys, sizeof(fp->sys), "%s", sys ? sys : "fork");
-    fp->used = false;
-}
-
-// Return the newest pending fork attempt for parent_pid within a time window.
-static fork_pending_t *fork_pending_match(supervisor_ctx_t *c, pid_t parent_pid, uint64_t now_ts_ms) {
-    const uint64_t window_ms = 2000; // configurable later
-    fork_pending_t *best = NULL;
-    for (size_t i = 0; i < c->fork_pending_len; i++) {
-        fork_pending_t *fp = &c->fork_pending[i];
-        if (fp->used) continue;
-        if (fp->parent_pid != parent_pid) continue;
-        if (now_ts_ms < fp->attempt_ts_ms) continue;
-        if ((now_ts_ms - fp->attempt_ts_ms) > window_ms) continue;
-        if (!best || fp->attempt_ts_ms > best->attempt_ts_ms) best = fp;
-    }
-    return best;
-}
-
-// Emit a one-time proc_seen event for each pid, and (best-effort) correlate fork->child_pid.
-static void proc_seen_maybe(supervisor_ctx_t *c) {
-    cache_proc_identity(c, c->cur_pid);
-
-    pid_t pid  = c->cache_pid;   // tgid
-    pid_t ppid = c->cache_ppid;
-    if (pid <= 0) return;
-
-    if (seen_pid_has(c, pid)) return;
-
-    // Mark seen *before* emitting to avoid loops if anything triggers re-entrancy.
-    seen_pid_add(c, pid);
-
-    emit_evt(c, "proc_seen", "\"note\":\"first_seen\"");
-
-    // If this process has a known parent, try to match it to a recent fork attempt.
-    if (ppid > 0) {
-        uint64_t now_ts = now_ms();
-        fork_pending_t *fp = fork_pending_match(c, ppid, now_ts);
-        if (fp) {
-            emit_evt(c, "proc_fork_result",
-                     "\"sys\":\"%s\",\"parent_pid\":%d,\"child_pid\":%d,\"attempt_idx\":%llu",
-                     fp->sys, (int)ppid, (int)pid, (unsigned long long)fp->attempt_idx);
-            fp->used = true;
-        }
-    }
-}
-
-
-
-// ---------- fd mapping helpers (best-effort) ----------
-static const char *fdmap_get(supervisor_ctx_t *c, pid_t tid, int fd) {
-    for (size_t i = 0; i < c->fdmap_len; i++) {
-        if (c->fdmap[i].tid == tid && c->fdmap[i].fd == fd) return c->fdmap[i].target;
-    }
-    return NULL;
-}
-
-static void fdmap_del(supervisor_ctx_t *c, pid_t tid, int fd) {
-    for (size_t i = 0; i < c->fdmap_len; i++) {
-        if (c->fdmap[i].tid == tid && c->fdmap[i].fd == fd) {
-            // swap-remove
-            c->fdmap[i] = c->fdmap[c->fdmap_len - 1];
-            c->fdmap_len--;
-            return;
-        }
-    }
-}
-
-static void fdmap_set(supervisor_ctx_t *c, pid_t tid, int fd, const char *target) {
-    for (size_t i = 0; i < c->fdmap_len; i++) {
-        if (c->fdmap[i].tid == tid && c->fdmap[i].fd == fd) {
-            strncpy(c->fdmap[i].target, target, sizeof(c->fdmap[i].target) - 1);
-            c->fdmap[i].target[sizeof(c->fdmap[i].target) - 1] = '\0';
-            return;
-        }
-    }
-    if (c->fdmap_len == c->fdmap_cap) {
-        size_t newcap = (c->fdmap_cap == 0) ? 256 : (c->fdmap_cap * 2);
-        fd_map_ent_t *p = (fd_map_ent_t*)realloc(c->fdmap, newcap * sizeof(fd_map_ent_t));
-        if (!p) return;
-        c->fdmap = p;
-        c->fdmap_cap = newcap;
-    }
-    c->fdmap[c->fdmap_len].tid = tid;
-    c->fdmap[c->fdmap_len].fd = fd;
-    strncpy(c->fdmap[c->fdmap_len].target, target, sizeof(c->fdmap[c->fdmap_len].target) - 1);
-    c->fdmap[c->fdmap_len].target[sizeof(c->fdmap[c->fdmap_len].target) - 1] = '\0';
-    c->fdmap_len++;
-}
-
-static bool resolve_fd_target(pid_t tid, int fd, char *out, size_t outsz) {
-    char linkpath[128];
-    snprintf(linkpath, sizeof(linkpath), "/proc/%d/fd/%d", (int)tid, fd);
-    ssize_t n = readlink(linkpath, out, (outsz > 0 ? outsz - 1 : 0));
-    if (n <= 0) return false;
-    out[n] = '\0';
-    return true;
-}
-
-
-static void ensure_fd_resolved(supervisor_ctx_t *c, pid_t tid, int fd) {
-    if (fd < 0) return;
-    if (fdmap_get(c, tid, fd)) return;
-
-    char target[PATH_MAX];
-    if (!resolve_fd_target(tid, fd, target, sizeof(target))) return;
-
-    // Cache first, then emit. Emission itself may trigger further lookups.
-    fdmap_set(c, tid, fd, target);
-
-    const char *kind = "other";
-    if (strncmp(target, "socket:[", 8) == 0) kind = "socket";
-    else if (strncmp(target, "pipe:[", 6) == 0) kind = "pipe";
-    else if (strncmp(target, "anon_inode:[", 12) == 0) kind = "anon_inode";
-    else if (target[0] == '/') kind = "file";
-
-    char esc[PATH_MAX * 2];
-    json_escape_to_buf(target, esc, sizeof(esc));
-    emit_evt(c, "fd_open_result", "\"fd\":%d,\"kind\":\"%s\",\"target\":\"%s\"", fd, kind, esc);
-}
-
 
 static int respond_continue_chk(int notify_fd, uint64_t id) {
     struct seccomp_notif_resp resp;
@@ -1203,8 +1007,8 @@ static void handle_exec(supervisor_ctx_t *c, struct seccomp_notif *req) {
     // Allow exactly one initial exec: the target sample itself.
     if (!c->saw_initial_exec && c->sample_abs[0] && strcmp(abs, c->sample_abs) == 0) {
         c->saw_initial_exec = true;
-        emit_evt(c, "exec_allow_initial", "\"abs\":\"%s\"", abs);
-        emit_evt(c, "exec_commit", "\"abs\":\"%s\",\"path\":\"%s\",\"reason\":\"initial\"", abs, path);
+    emit_evt(c, "exec_allow_dev", '"abs":"%s"', abs);
+    emit_evt(c, "exec_commit", '"abs":"%s","path":"%s","reason":"dev"', abs, path);
     c->cache_tid = -1; // comm cache may change after exec
     respond_continue(c->notify_fd, req->id);
     return;
@@ -1240,10 +1044,7 @@ static void handle_fork(supervisor_ctx_t *c, struct seccomp_notif *req) {
     const char *sys = (req->data.nr == __NR_clone3) ? "clone3" :
                       (req->data.nr == __NR_clone) ? "clone" :
                       (req->data.nr == __NR_vfork) ? "vfork" : "fork";
-    uint64_t attempt_idx = emit_evt(c, "proc_fork_attempt", "\"sys\":\"%s\"", sys);
-    // Best-effort: correlate this attempt with a child pid when we first see the new process.
-    cache_proc_identity(c, c->cur_pid);
-    fork_pending_add(c, c->cache_pid, attempt_idx, sys, now_ms());
+    emit_evt(c, "proc_fork_attempt", "\"sys\":\"%s\"", sys);
     if (c->mode == MODE_MALWARE) {
         hard_kill(c, "fork_boundary");
         respond_errno(c->notify_fd, req->id, EPERM);
@@ -1599,61 +1400,27 @@ static void handle_mprotect(supervisor_ctx_t *c, struct seccomp_notif *req) {
     respond_continue(c->notify_fd, req->id);
 }
 
-
 static void handle_fd(supervisor_ctx_t *c, struct seccomp_notif *req) {
     int nr = (int)req->data.nr;
     int fd = (int)req->data.args[0];
-    pid_t tid = c->cur_pid;
-
-    // Lazily resolve fd -> target via /proc so UI can show "read libc.so.6" instead of "fd=4".
-    // This is best-effort and does NOT affect the syscall outcome.
-    ensure_fd_resolved(c, tid, fd);
-
-    const char *tgt = fdmap_get(c, tid, fd);
-    char esc[PATH_MAX * 2];
-    if (tgt) json_escape_to_buf(tgt, esc, sizeof(esc));
 
     switch (nr) {
         case __NR_read:
         case __NR_write: {
             size_t cnt = (size_t)req->data.args[2];
-            if (tgt && tgt[0] == '/') {
-                emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
-                         "\"fd\":%d,\"count\":%zu,\"abs\":\"%s\"", fd, cnt, esc);
-            } else if (tgt) {
-                emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
-                         "\"fd\":%d,\"count\":%zu,\"target\":\"%s\"", fd, cnt, esc);
-            } else {
-                emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
-                         "\"fd\":%d,\"count\":%zu", fd, cnt);
-            }
+            emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
+                     "\"fd\":%d,\"count\":%zu", fd, cnt);
             break;
         }
         case __NR_readv:
         case __NR_writev: {
             int iovcnt = (int)req->data.args[2];
-            if (tgt && tgt[0] == '/') {
-                emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
-                         "\"fd\":%d,\"iovcnt\":%d,\"abs\":\"%s\"", fd, iovcnt, esc);
-            } else if (tgt) {
-                emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
-                         "\"fd\":%d,\"iovcnt\":%d,\"target\":\"%s\"", fd, iovcnt, esc);
-            } else {
-                emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
-                         "\"fd\":%d,\"iovcnt\":%d", fd, iovcnt);
-            }
+            emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
+                     "\"fd\":%d,\"iovcnt\":%d", fd, iovcnt);
             break;
         }
         case __NR_close:
-            if (tgt && tgt[0] == '/') {
-                emit_evt(c, "fd_close", "\"fd\":%d,\"abs\":\"%s\"", fd, esc);
-            } else if (tgt) {
-                emit_evt(c, "fd_close", "\"fd\":%d,\"target\":\"%s\"", fd, esc);
-            } else {
-                emit_evt(c, "fd_close", "\"fd\":%d", fd);
-            }
-            // prevent FD reuse confusion in later events
-            fdmap_del(c, tid, fd);
+            emit_evt(c, "fd_close", "\"fd\":%d", fd);
             break;
         case __NR_fcntl: {
             long cmd = (long)req->data.args[1];
@@ -1740,9 +1507,6 @@ static void *supervisor_thread(void *arg) {
 
         c->cur_pid = (pid_t)req->pid;
         get_tracee_cwd(c->cur_pid, c->tracee_cwd, sizeof(c->tracee_cwd));
-
-        // Track new processes + correlate fork->child_pid.
-        proc_seen_maybe(c);
 
         events++;
         switch (req->data.nr) {
@@ -2010,10 +1774,7 @@ int main(int argc, char **argv) {
         // Ensure child is reaped if it exited
         (void)kill(child, SIGKILL);
         int st=0; (void)waitpid(child, &st, 0);
-        free(ctx.fdmap);
-    ctx.fdmap = NULL;
-
-    fclose(ctx.events_fp);
+        fclose(ctx.events_fp);
         return 1;
     }
     close(sp[0]);
