@@ -316,6 +316,20 @@ typedef struct fd_map_ent_t {
     char  target[PATH_MAX];  // readlink(/proc/<tid>/fd/<fd>)
 } fd_map_ent_t;
 
+// -------- fork/clone correlation (best-effort) --------
+// With SECCOMP_USER_NOTIF + CONTINUE, we don't get the fork/clone return value.
+// Instead we correlate a recent proc_fork_attempt from parent_pid with the first
+// time we observe a new pid whose ppid == parent_pid.
+typedef struct fork_pending_t {
+    pid_t parent_pid;        // parent tgid
+    uint64_t attempt_idx;     // event idx of proc_fork_attempt
+    uint64_t attempt_ts_ms;   // timestamp when attempt was observed
+    char sys[8];              // "fork","vfork","clone","clone3"
+    bool used;                // matched to a child already
+} fork_pending_t;
+
+
+
 
 typedef struct {
     pid_t tracee;
@@ -362,6 +376,16 @@ typedef struct {
     fd_map_ent_t *fdmap;
     size_t fdmap_len;
     size_t fdmap_cap;
+
+
+    // Process tracking (best-effort): emit proc_seen once per pid; correlate fork->child_pid.
+    pid_t *seen_pids;
+    size_t seen_pids_len;
+    size_t seen_pids_cap;
+
+    fork_pending_t *fork_pending;
+    size_t fork_pending_len;
+    size_t fork_pending_cap;
 
 // Quarantine: prevent executing newly written (dropped) files while still tracing.
     bool quarantine_drops;
@@ -577,7 +601,7 @@ static void cache_proc_identity(supervisor_ctx_t *c, pid_t tid) {
     fclose(fp);
 }
 
-static void emit_evt(supervisor_ctx_t *c, const char *event, const char *fmt, ...) {
+static uint64_t emit_evt(supervisor_ctx_t *c, const char *event, const char *fmt, ...) {
     uint64_t ts = now_ms();
     uint64_t idx = c->evt_idx++;
 
@@ -612,7 +636,91 @@ static void emit_evt(supervisor_ctx_t *c, const char *event, const char *fmt, ..
     }
     fprintf(c->events_fp, "}\n");
     fflush(c->events_fp);
+    return idx;
 }
+
+static bool seen_pid_has(supervisor_ctx_t *c, pid_t pid) {
+    for (size_t i = 0; i < c->seen_pids_len; i++) {
+        if (c->seen_pids[i] == pid) return true;
+    }
+    return false;
+}
+
+static void seen_pid_add(supervisor_ctx_t *c, pid_t pid) {
+    if (pid <= 0) return;
+    if (seen_pid_has(c, pid)) return;
+    if (c->seen_pids_len + 1 > c->seen_pids_cap) {
+        size_t new_cap = c->seen_pids_cap ? (c->seen_pids_cap * 2) : 128;
+        pid_t *np = (pid_t*)realloc(c->seen_pids, new_cap * sizeof(pid_t));
+        if (!np) return;
+        c->seen_pids = np;
+        c->seen_pids_cap = new_cap;
+    }
+    c->seen_pids[c->seen_pids_len++] = pid;
+}
+
+static void fork_pending_add(supervisor_ctx_t *c, pid_t parent_pid, uint64_t attempt_idx, const char *sys, uint64_t ts_ms) {
+    if (parent_pid <= 0) return;
+    if (c->fork_pending_len + 1 > c->fork_pending_cap) {
+        size_t new_cap = c->fork_pending_cap ? (c->fork_pending_cap * 2) : 64;
+        fork_pending_t *np = (fork_pending_t*)realloc(c->fork_pending, new_cap * sizeof(fork_pending_t));
+        if (!np) return;
+        c->fork_pending = np;
+        c->fork_pending_cap = new_cap;
+    }
+    fork_pending_t *fp = &c->fork_pending[c->fork_pending_len++];
+    memset(fp, 0, sizeof(*fp));
+    fp->parent_pid = parent_pid;
+    fp->attempt_idx = attempt_idx;
+    fp->attempt_ts_ms = ts_ms;
+    snprintf(fp->sys, sizeof(fp->sys), "%s", sys ? sys : "fork");
+    fp->used = false;
+}
+
+// Return the newest pending fork attempt for parent_pid within a time window.
+static fork_pending_t *fork_pending_match(supervisor_ctx_t *c, pid_t parent_pid, uint64_t now_ts_ms) {
+    const uint64_t window_ms = 2000; // configurable later
+    fork_pending_t *best = NULL;
+    for (size_t i = 0; i < c->fork_pending_len; i++) {
+        fork_pending_t *fp = &c->fork_pending[i];
+        if (fp->used) continue;
+        if (fp->parent_pid != parent_pid) continue;
+        if (now_ts_ms < fp->attempt_ts_ms) continue;
+        if ((now_ts_ms - fp->attempt_ts_ms) > window_ms) continue;
+        if (!best || fp->attempt_ts_ms > best->attempt_ts_ms) best = fp;
+    }
+    return best;
+}
+
+// Emit a one-time proc_seen event for each pid, and (best-effort) correlate fork->child_pid.
+static void proc_seen_maybe(supervisor_ctx_t *c) {
+    cache_proc_identity(c, c->cur_pid);
+
+    pid_t pid  = c->cache_pid;   // tgid
+    pid_t ppid = c->cache_ppid;
+    if (pid <= 0) return;
+
+    if (seen_pid_has(c, pid)) return;
+
+    // Mark seen *before* emitting to avoid loops if anything triggers re-entrancy.
+    seen_pid_add(c, pid);
+
+    emit_evt(c, "proc_seen", "\"note\":\"first_seen\"");
+
+    // If this process has a known parent, try to match it to a recent fork attempt.
+    if (ppid > 0) {
+        uint64_t now_ts = now_ms();
+        fork_pending_t *fp = fork_pending_match(c, ppid, now_ts);
+        if (fp) {
+            emit_evt(c, "proc_fork_result",
+                     "\"sys\":\"%s\",\"parent_pid\":%d,\"child_pid\":%d,\"attempt_idx\":%llu",
+                     fp->sys, (int)ppid, (int)pid, (unsigned long long)fp->attempt_idx);
+            fp->used = true;
+        }
+    }
+}
+
+
 
 // ---------- fd mapping helpers (best-effort) ----------
 static const char *fdmap_get(supervisor_ctx_t *c, pid_t tid, int fd) {
@@ -1132,7 +1240,10 @@ static void handle_fork(supervisor_ctx_t *c, struct seccomp_notif *req) {
     const char *sys = (req->data.nr == __NR_clone3) ? "clone3" :
                       (req->data.nr == __NR_clone) ? "clone" :
                       (req->data.nr == __NR_vfork) ? "vfork" : "fork";
-    emit_evt(c, "proc_fork_attempt", "\"sys\":\"%s\"", sys);
+    uint64_t attempt_idx = emit_evt(c, "proc_fork_attempt", "\"sys\":\"%s\"", sys);
+    // Best-effort: correlate this attempt with a child pid when we first see the new process.
+    cache_proc_identity(c, c->cur_pid);
+    fork_pending_add(c, c->cache_pid, attempt_idx, sys, now_ms());
     if (c->mode == MODE_MALWARE) {
         hard_kill(c, "fork_boundary");
         respond_errno(c->notify_fd, req->id, EPERM);
@@ -1629,6 +1740,9 @@ static void *supervisor_thread(void *arg) {
 
         c->cur_pid = (pid_t)req->pid;
         get_tracee_cwd(c->cur_pid, c->tracee_cwd, sizeof(c->tracee_cwd));
+
+        // Track new processes + correlate fork->child_pid.
+        proc_seen_maybe(c);
 
         events++;
         switch (req->data.nr) {

@@ -209,51 +209,139 @@ def add_stage_ids(events: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def build_process_index(events: list[dict], stages: list[dict]):
-    """Build a minimal process table + parent/child edges for UI."""
+    """Build a minimal process table + parent/child edges for UI.
+
+    Priority order for parent/child reconstruction:
+      1) proc_fork_result edges (authoritative best-effort correlation from C backend)
+      2) ppid field fallback (heuristic / can be lossy for short-lived processes)
+
+    Returns:
+      processes: list[dict] process table entries
+      process_tree: list[dict] nested tree (roots)
+      process_edges: list[dict] edge list with metadata (sys/attempt_idx)
+    """
     procs: dict[int, dict] = {}
+    edges: list[dict] = []
+
+    def _ensure_proc(pid: int):
+        if pid not in procs:
+            procs[pid] = {
+                "pid": pid,
+                "ppid": None,
+                "comm": None,
+                "first_idx": None,
+                "last_idx": None,
+                "first_ts_ms": None,
+                "last_ts_ms": None,
+                "exec_chain": [],
+                "children": [],
+                "child_edges": [],   # [{child_pid, sys, attempt_idx, idx, ts_ms}]
+            }
+        return procs[pid]
+
+    # Pass 1: build process table + collect fork_result edges
     for ev in events:
-        pid = int(ev.get("pid", -1))
+        try:
+            pid = int(ev.get("pid", -1))
+        except Exception:
+            pid = -1
         if pid < 0:
             continue
-        p = procs.setdefault(pid, {
-            "pid": pid,
-            "ppid": ev.get("ppid"),
-            "comm": ev.get("comm"),
-            "first_idx": ev.get("idx"),
-            "last_idx": ev.get("idx"),
-            "first_ts_ms": ev.get("ts_ms"),
-            "last_ts_ms": ev.get("ts_ms"),
-            "exec_chain": [],
-            "children": [],
-        })
-        # Update rolling facts
-        p["ppid"] = ev.get("ppid", p["ppid"])
-        if ev.get("comm"):
-            p["comm"] = ev.get("comm")
+
+        p = _ensure_proc(pid)
+
+        # Initialize / roll forward stats
+        if p["first_idx"] is None:
+            p["first_idx"] = ev.get("idx")
+            p["first_ts_ms"] = ev.get("ts_ms")
         p["last_idx"] = ev.get("idx", p["last_idx"])
         p["last_ts_ms"] = ev.get("ts_ms", p["last_ts_ms"])
 
+        # Rolling identity facts
+        if ev.get("ppid") is not None:
+            p["ppid"] = ev.get("ppid")
+        if ev.get("comm"):
+            p["comm"] = ev.get("comm")
+
         et = str(ev.get("event", ""))
-        if et.startswith("exec_allow") and ev.get("abs"):
+
+        # Prefer exec_commit as the "image" boundary when present; fall back to exec_allow_*
+        if et == "exec_commit" and ev.get("abs"):
+            p["exec_chain"].append(ev.get("abs"))
+        elif et.startswith("exec_allow") and ev.get("abs"):
             p["exec_chain"].append(ev.get("abs"))
 
-    # Edges
-    for pid, p in procs.items():
-        ppid = p.get("ppid")
-        if isinstance(ppid, int) and ppid in procs and ppid != pid:
-            procs[ppid]["children"].append(pid)
+        # Collect authoritative parent/child edges when available
+        if et == "proc_fork_result":
+            try:
+                parent_pid = int(ev.get("parent_pid", -1))
+                child_pid = int(ev.get("child_pid", -1))
+            except Exception:
+                parent_pid, child_pid = -1, -1
+            if parent_pid > 0 and child_pid > 0 and parent_pid != child_pid:
+                edge = {
+                    "parent_pid": parent_pid,
+                    "child_pid": child_pid,
+                    "sys": ev.get("sys"),
+                    "attempt_idx": ev.get("attempt_idx"),
+                    "idx": ev.get("idx"),
+                    "ts_ms": ev.get("ts_ms"),
+                }
+                edges.append(edge)
+                _ensure_proc(parent_pid)
+                _ensure_proc(child_pid)
 
-    # Roots (ppid not in table)
-    roots = [pid for pid, p in procs.items() if not (isinstance(p.get("ppid"), int) and p["ppid"] in procs and p["ppid"] != pid)]
+    # Pass 2: apply edges with priority, then fill remaining via ppid fallback
+    parent_of: dict[int, int] = {}
+
+    # Apply proc_fork_result edges first
+    for e in edges:
+        parent_pid = e["parent_pid"]
+        child_pid = e["child_pid"]
+        if child_pid in parent_of:
+            continue  # keep first observed parent assignment
+        parent_of[child_pid] = parent_pid
+        procs[child_pid]["ppid"] = parent_pid
+        procs[parent_pid]["children"].append(child_pid)
+        procs[parent_pid]["child_edges"].append({
+            "child_pid": child_pid,
+            "sys": e.get("sys"),
+            "attempt_idx": e.get("attempt_idx"),
+            "idx": e.get("idx"),
+            "ts_ms": e.get("ts_ms"),
+        })
+
+    # Fallback: use ppid if we don't already have an authoritative edge
+    for pid, p in procs.items():
+        if pid in parent_of:
+            continue
+        ppid = p.get("ppid")
+        if isinstance(ppid, int) and ppid > 0 and ppid in procs and ppid != pid:
+            parent_of[pid] = ppid
+            procs[ppid]["children"].append(pid)
+            procs[ppid]["child_edges"].append({
+                "child_pid": pid,
+                "sys": "ppid",
+                "attempt_idx": None,
+                "idx": None,
+                "ts_ms": None,
+            })
+
+    # Roots (no parent inside table)
+    roots = [pid for pid in procs.keys() if pid not in parent_of]
     roots.sort()
 
     def _to_tree(pid: int):
         node = dict(procs[pid])
-        node["children"] = [ _to_tree(c) for c in sorted(node.get("children", [])) ]
+        node["children"] = [_to_tree(c) for c in sorted(node.get("children", []))]
         return node
 
-    tree = [ _to_tree(r) for r in roots ]
-    return list(procs.values()), tree
+    tree = [_to_tree(r) for r in roots]
+    processes = list(procs.values())
+    processes.sort(key=lambda x: (x.get("first_idx") is None, x.get("first_idx") or 0))
+
+    return processes, tree, edges
+
 
 def build_stage_summaries(events: list[dict], stages: list[dict], *, top_n: int = 10, include_loader: bool = False):
     """Compute deterministic per-stage digests.
@@ -842,7 +930,7 @@ def api_run_detail(run_id):
 
     # Derive stage_id + process tree
     events, stages = add_stage_ids(raw_events)
-    processes, proc_tree = build_process_index(events, stages)
+    processes, proc_tree, proc_edges = build_process_index(events, stages)
     # Stage digests (analysis/enrichment layer)
     stage_summaries = []
     if include_stage_summaries:
@@ -909,6 +997,7 @@ def api_run_detail(run_id):
         'stage_summaries': stage_summaries,
         'processes': processes,
         'process_tree': proc_tree,
+        'process_edges': proc_edges,
         'artifacts': artifacts,
         'snapshots': snapshots,
         'sockmap': sockmap,
