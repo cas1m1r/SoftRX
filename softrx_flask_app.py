@@ -129,13 +129,32 @@ def _decode_open_flags(flags: int | None) -> str:
 def add_stage_ids(events: list[dict]) -> tuple[list[dict], list[dict]]:
     """Derive stage_id from exec boundaries (cheap + deterministic).
 
-    stage_id format: "<pid>:<exec_seq>" where exec_seq increments after exec_allow*.
+    stage_id format: "<pid>:<exec_seq>" where exec_seq increments after an exec boundary.
+
+    Semantics:
+    - The stage_id groups events between exec boundaries for the *same pid*.
+    - We attach the "image" (what is now running) to the stage *after* the exec boundary.
+
+    Boundary selection:
+    - If the trace contains exec_commit (newer schema), we treat *only* exec_commit as the
+      boundary (so we don't double-increment when exec_allow_* is also present).
+    - If exec_commit is absent, we fall back to exec_allow_* as the boundary.
     """
     stage_seq: dict[int, int] = {}
     stages: dict[str, dict] = {}
 
+    # For each pid, the most recently committed exec target (applied to the *next* stage).
+    pending_image: dict[int, dict] = {}
+
     # Ensure deterministic order
     events_sorted = sorted(events, key=lambda e: int(e.get("idx", 0)))
+
+    has_exec_commit = any(str(e.get("event", "")) == "exec_commit" for e in events_sorted)
+
+    def _is_boundary(et: str) -> bool:
+        if has_exec_commit:
+            return et == "exec_commit"
+        return et.startswith("exec_allow")
 
     for ev in events_sorted:
         pid = int(ev.get("pid", -1))
@@ -148,6 +167,9 @@ def add_stage_ids(events: list[dict]) -> tuple[list[dict], list[dict]]:
 
         # Stage record (created on first touch)
         if sid not in stages:
+            img = pending_image.pop(pid, None)
+            img_abs = (img or {}).get("abs")
+            img_path = (img or {}).get("path")
             stages[sid] = {
                 "stage_id": sid,
                 "pid": pid,
@@ -155,15 +177,26 @@ def add_stage_ids(events: list[dict]) -> tuple[list[dict], list[dict]]:
                 "comm": ev.get("comm"),
                 "start_idx": ev.get("idx"),
                 "start_ts_ms": ev.get("ts_ms"),
-                "exec_abs": None,      # filled when we see exec_allow*
-                "exec_path": None,
+                # What is now running in this stage (best-effort)
+                "image_abs": img_abs,
+                "image_path": img_path,
+                # Back-compat aliases used by the current UI
+                "exec_abs": img_abs,
+                "exec_path": img_path,
+                # The boundary event that ended this stage (filled when we hit it)
+                "boundary_abs": None,
+                "boundary_path": None,
             }
 
-        # If the process just exec'd, bump the stage *after* this event
         et = str(ev.get("event", ""))
-        if et.startswith("exec_allow") or et in ("exec_commit",):
-            stages[sid]["exec_abs"] = ev.get("abs")
-            stages[sid]["exec_path"] = ev.get("path")
+        if _is_boundary(et):
+            # Record the exec target that ended *this* stage
+            stages[sid]["boundary_abs"] = ev.get("abs")
+            stages[sid]["boundary_path"] = ev.get("path")
+
+            # And apply it to the *next* stage as the running image
+            pending_image[pid] = {"abs": ev.get("abs"), "path": ev.get("path")}
+
             stage_seq[pid] = seq + 1
 
     # Fixup: propagate comm updates (comm can change after exec)
@@ -222,6 +255,154 @@ def build_process_index(events: list[dict], stages: list[dict]):
     tree = [ _to_tree(r) for r in roots ]
     return list(procs.values()), tree
 
+def build_stage_summaries(events: list[dict], stages: list[dict], *, top_n: int = 10, include_loader: bool = False):
+    """Compute deterministic per-stage digests.
+
+    This is an 'analysis/enrichment' layer that stays non-speculative:
+    - uses existing event fields (pid/ppid/comm/stage_id/abs/dst/adds_exec)
+    - aggregates counts and top file/destination touches
+    - filters loader noise by default
+    """
+    # Index stage metadata
+    stage_meta: dict[str, dict] = {s.get("stage_id"): dict(s) for s in stages if s.get("stage_id")}
+    stage_stats: dict[str, dict] = {}
+
+    def _get(sid: str) -> dict:
+        if sid not in stage_stats:
+            sm = stage_meta.get(sid, {})
+            stage_stats[sid] = {
+                "stage_id": sid,
+                "pid": sm.get("pid"),
+                "ppid": sm.get("ppid"),
+                "comm": sm.get("comm"),
+                "image_abs": sm.get("image_abs") or sm.get("exec_abs"),
+                "image_path": sm.get("image_path") or sm.get("exec_path"),
+                "boundary_abs": sm.get("boundary_abs"),
+                "boundary_path": sm.get("boundary_path"),
+                "start_idx": sm.get("start_idx"),
+                "end_idx": sm.get("start_idx"),
+                "start_ts_ms": sm.get("start_ts_ms"),
+                "end_ts_ms": sm.get("start_ts_ms"),
+                "duration_ms": 0,
+                "counts": {
+                    "exec": 0,
+                    "fs_open": 0,
+                    "fd_open": 0,
+                    "fd_read": 0,
+                    "fd_write": 0,
+                    "fd_close": 0,
+                    "net": 0,
+                    "mprotect_exec": 0,
+                    "policy": 0,
+                },
+                "top_files": [],     # filled later
+                "top_net_dsts": [],  # filled later
+                "notes": [],
+            }
+            stage_stats[sid]["_files"] = {}  # abs -> counters
+            stage_stats[sid]["_dsts"] = {}   # dst -> counters
+        return stage_stats[sid]
+
+    for ev in events:
+        sid = ev.get("stage_id")
+        if not sid:
+            continue
+        st = _get(sid)
+
+        idx = ev.get("idx")
+        ts = ev.get("ts_ms")
+
+        # Update end markers
+        if isinstance(idx, int) and (st["end_idx"] is None or idx > st["end_idx"]):
+            st["end_idx"] = idx
+        elif st["end_idx"] is None:
+            st["end_idx"] = idx
+
+        if isinstance(ts, (int, float)) and (st["end_ts_ms"] is None or ts > st["end_ts_ms"]):
+            st["end_ts_ms"] = ts
+        elif st["end_ts_ms"] is None:
+            st["end_ts_ms"] = ts
+
+        et = str(ev.get("event", ""))
+
+        # Counts
+        if et.startswith("exec_"):
+            st["counts"]["exec"] += 1
+        elif et == "fs_open_attempt" or et.startswith("fs_open_"):
+            st["counts"]["fs_open"] += 1
+        elif et == "fd_open_result":
+            st["counts"]["fd_open"] += 1
+        elif et in ("fd_read", "fd_readv"):
+            st["counts"]["fd_read"] += 1
+        elif et in ("fd_write", "fd_writev"):
+            st["counts"]["fd_write"] += 1
+        elif et == "fd_close":
+            st["counts"]["fd_close"] += 1
+        elif et.startswith("net_"):
+            st["counts"]["net"] += 1
+        elif et == "mprotect" and bool(ev.get("adds_exec", False)):
+            st["counts"]["mprotect_exec"] += 1
+        elif et in ("hard_kill","snapshot","timeout_halt","max_events_halt"):
+            st["counts"]["policy"] += 1
+
+        # File touches (prefer resolved abs)
+        abs_p = ev.get("abs") or ev.get("target") or ev.get("path")
+        if isinstance(abs_p, str) and abs_p:
+            if include_loader or not _is_loaderish_path(abs_p):
+                f = st["_files"].setdefault(abs_p, {"opens": 0, "reads": 0, "writes": 0, "closes": 0})
+                if et.startswith("fs_open") or et == "fd_open_result":
+                    f["opens"] += 1
+                if et in ("fd_read", "fd_readv"):
+                    f["reads"] += 1
+                if et in ("fd_write", "fd_writev"):
+                    f["writes"] += 1
+                if et == "fd_close":
+                    f["closes"] += 1
+
+        # Net destinations
+        dst = ev.get("dst")
+        if isinstance(dst, str) and dst:
+            d = st["_dsts"].setdefault(dst, {"count": 0})
+            d["count"] += 1
+
+    # Finalize: duration + top lists + notes
+    summaries = []
+    for sid, st in stage_stats.items():
+        try:
+            if isinstance(st["start_ts_ms"], (int, float)) and isinstance(st["end_ts_ms"], (int, float)):
+                st["duration_ms"] = int(st["end_ts_ms"] - st["start_ts_ms"])
+        except Exception:
+            st["duration_ms"] = 0
+
+        files = []
+        for p, c in st["_files"].items():
+            score = (c["opens"] * 3) + (c["reads"] * 2) + (c["writes"] * 4)
+            files.append({"abs": p, **c, "_score": score})
+        files.sort(key=lambda x: (x["_score"], x["writes"], x["reads"], x["opens"]), reverse=True)
+        st["top_files"] = [{k: v for k, v in f.items() if k != "_score"} for f in files[:top_n]]
+
+        dsts = [{"dst": d, "count": c["count"]} for d, c in st["_dsts"].items()]
+        dsts.sort(key=lambda x: x["count"], reverse=True)
+        st["top_net_dsts"] = dsts[:top_n]
+
+        # Notes
+        if st["counts"]["mprotect_exec"] > 0:
+            st["notes"].append("memory protections added EXEC")
+        if st["counts"]["net"] > 0:
+            st["notes"].append(f"network activity ({st['counts']['net']} events)")
+        if st["top_files"]:
+            st["notes"].append(f"file activity ({len(st['top_files'])} top paths)")
+
+        # Drop private scratch
+        st.pop("_files", None)
+        st.pop("_dsts", None)
+
+        summaries.append(st)
+
+    # Sort by (pid, start_idx)
+    summaries.sort(key=lambda s: (int(s.get("pid") or -1), int(s.get("start_idx") or 0)))
+    return summaries
+
 
 def _friendly_label(ev: dict) -> str:
     et = str(ev.get("event", ""))
@@ -229,6 +410,12 @@ def _friendly_label(ev: dict) -> str:
     # Synthetic rows
     if et == "fs_loader_group":
         return f"loader: {ev.get('count', 0)} library/ld opens (collapsed)"
+    if et == "fs_loader_io":
+        abs_p = ev.get("abs") or ev.get("path") or ""
+        tail = abs_p.split("/")[-1] if abs_p else "(unknown)"
+        reads = int(ev.get("reads", 0) or 0)
+        b = int(ev.get("bytes", 0) or 0)
+        return f"loader io: {tail} ({reads} reads, {b} bytes)"
     if et == "fd_read_group":
         return f"read: fd={ev.get('fd')} x{ev.get('count', 0)} ({ev.get('bytes', 0)} bytes)"
 
@@ -250,6 +437,9 @@ def _friendly_label(ev: dict) -> str:
     if et.startswith("exec_allow"):
         abs_p = ev.get("abs") or ""
         return f"exec ✓ {abs_p}"
+    if et == "exec_commit":
+        abs_p = ev.get("abs") or ev.get("path") or ""
+        return f"exec ↳ {abs_p}"
     if et == "proc_fork_attempt":
         return f"fork/clone?"
     if et == "net_connect_attempt":
@@ -262,9 +452,40 @@ def _friendly_label(ev: dict) -> str:
         return f"mprotect prot={ev.get('prot')} adds_exec={bool(ev.get('adds_exec'))}"
     if et.startswith("fd_"):
         fd = ev.get("fd")
+        abs_p = ev.get("abs")
+        tgt = ev.get("target")
+        name = ""
+        if isinstance(abs_p, str) and abs_p:
+            name = abs_p.split("/")[-1]
+        elif isinstance(tgt, str) and tgt:
+            name = tgt
+
+        if et == "fd_open_result":
+            # from C lazy resolver
+            kind = ev.get("kind") or ""
+            if name:
+                return f"fd={fd} → {name} ({kind})"
+            return f"fd_open_result fd={fd} ({kind})"
+
         if et == "fd_read":
+            if name:
+                return f"read {name} (fd={fd}, {ev.get('count')} bytes)"
             return f"read fd={fd} ({ev.get('count')} bytes)"
+        if et == "fd_readv":
+            if name:
+                return f"readv {name} (fd={fd}, iov={ev.get('iovcnt')})"
+            return f"readv fd={fd} (iov={ev.get('iovcnt')})"
+        if et == "fd_write":
+            if name:
+                return f"write {name} (fd={fd}, {ev.get('count')} bytes)"
+            return f"write fd={fd} ({ev.get('count')} bytes)"
+        if et == "fd_writev":
+            if name:
+                return f"writev {name} (fd={fd}, iov={ev.get('iovcnt')})"
+            return f"writev fd={fd} (iov={ev.get('iovcnt')})"
         if et == "fd_close":
+            if name:
+                return f"close {name} (fd={fd})"
             return f"close fd={fd}"
         return f"{et} fd={fd}"
     return et
@@ -288,40 +509,129 @@ def build_compact_timeline(events: list[dict], *, hide_mem_noise: bool = True, c
             i += 1
             continue
 
-        # 2) Collapse consecutive loader/library opens
+        # 2) Collapse loader I/O into a single row per file.
+        #
+        # In your trace, loader-ish work is usually:
+        #   fs_open_attempt(abs=/usr/lib/.../libc.so.6)
+        #   fd_open_result(fd=..., abs=/usr/lib/.../libc.so.6)
+        #   (maybe fd_fcntl...)
+        #   fd_read...
+        #   fd_close
+        #
+        # Collapsing only fs_open_attempt still left tons of fd_open_result/fd_close noise.
         if collapse_loader and et == "fs_open_attempt" and _is_loaderish_path(str(ev.get("abs", ""))):
-            j = i
-            sample_paths = []
-            while j < n:
+            pid = ev.get("pid")
+            sid = ev.get("stage_id")
+
+            j = i + 1
+            fd = None
+            abs_p = ev.get("abs") or ev.get("path")
+            kind = None
+
+            # Optional: capture fd+abs from the immediate fd_open_result
+            if j < n:
                 ev2 = events[j]
-                if str(ev2.get("event","")) != "fs_open_attempt":
+                if (str(ev2.get("event", "")) == "fd_open_result" and ev2.get("pid") == pid and ev2.get("stage_id") == sid):
+                    fd = ev2.get("fd")
+                    abs_p = ev2.get("abs") or abs_p
+                    kind = ev2.get("kind")
+                    j += 1
+
+            reads = 0
+            bytes_read = 0
+            consumed = 1 + (1 if fd is not None else 0)
+            closed = False
+
+            # Consume fd_* noise until we see the close for this fd.
+            while j < n:
+                ev3 = events[j]
+                if ev3.get("pid") != pid or ev3.get("stage_id") != sid:
                     break
-                if not _is_loaderish_path(str(ev2.get("abs", ""))):
+
+                et3 = str(ev3.get("event", ""))
+                fd3 = ev3.get("fd")
+
+                if et3 in ("fd_fcntl", "fd_fstat", "fd_lseek", "fd_mmap", "fd_munmap") and (fd is None or fd3 == fd):
+                    j += 1
+                    consumed += 1
+                    continue
+
+                if et3 in ("fd_read", "fd_readv") and (fd is None or fd3 == fd):
+                    reads += 1
+                    try:
+                        bytes_read += int(ev3.get("count", 0) or 0)
+                    except Exception:
+                        pass
+                    j += 1
+                    consumed += 1
+                    continue
+
+                if et3 == "fd_close" and (fd is None or fd3 == fd):
+                    j += 1
+                    consumed += 1
+                    closed = True
                     break
-                # Keep within same pid+stage for sanity
-                if ev2.get("pid") != ev.get("pid") or ev2.get("stage_id") != ev.get("stage_id"):
-                    break
-                if len(sample_paths) < 3 and ev2.get("abs"):
-                    sample_paths.append(ev2.get("abs"))
-                j += 1
-            count = j - i
-            if count >= 4:  # only worth collapsing if it's real noise
+
+                # Stop if the pattern breaks.
+                break
+
+            # Only collapse if we actually saw a full-ish open->close pattern.
+            if closed and consumed >= 4:
                 synthetic = {
                     "ts_ms": ev.get("ts_ms"),
                     "idx": ev.get("idx"),
-                    "event": "fs_loader_group",
-                    "pid": ev.get("pid"),
+                    "event": "fs_loader_io",
+                    "pid": pid,
                     "tid": ev.get("tid"),
                     "ppid": ev.get("ppid"),
                     "comm": ev.get("comm"),
-                    "stage_id": ev.get("stage_id"),
-                    "count": count,
-                    "samples": sample_paths,
+                    "stage_id": sid,
+                    "fd": fd,
+                    "abs": abs_p,
+                    "kind": kind,
+                    "reads": reads,
+                    "bytes": bytes_read,
+                    "consumed": consumed,
                 }
                 synthetic["label"] = _friendly_label(synthetic)
                 out.append(synthetic)
                 i = j
                 continue
+
+            # If we couldn't collapse into loader_io, fall back to the older "group of opens" behavior.
+            # This catches odd cases where the fd_open_result/close isn't adjacent or is missing.
+            if collapse_loader:
+                j2 = i
+                sample_paths = []
+                while j2 < n:
+                    ev2 = events[j2]
+                    if str(ev2.get("event", "")) != "fs_open_attempt":
+                        break
+                    if not _is_loaderish_path(str(ev2.get("abs", ""))):
+                        break
+                    if ev2.get("pid") != ev.get("pid") or ev2.get("stage_id") != ev.get("stage_id"):
+                        break
+                    if len(sample_paths) < 3 and ev2.get("abs"):
+                        sample_paths.append(ev2.get("abs"))
+                    j2 += 1
+                count = j2 - i
+                if count >= 4:
+                    synthetic = {
+                        "ts_ms": ev.get("ts_ms"),
+                        "idx": ev.get("idx"),
+                        "event": "fs_loader_group",
+                        "pid": ev.get("pid"),
+                        "tid": ev.get("tid"),
+                        "ppid": ev.get("ppid"),
+                        "comm": ev.get("comm"),
+                        "stage_id": ev.get("stage_id"),
+                        "count": count,
+                        "samples": sample_paths,
+                    }
+                    synthetic["label"] = _friendly_label(synthetic)
+                    out.append(synthetic)
+                    i = j2
+                    continue
 
         # 3) Group consecutive fd_read on same fd
         if group_fd_reads and et == "fd_read":
@@ -516,6 +826,12 @@ def api_run_detail(run_id):
     hide_mem_noise = request.args.get("hide_mem", "1") == "1"
     collapse_loader = request.args.get("collapse_loader", "1") == "1"
     group_fd_reads = request.args.get("group_fd", "1") == "1"
+    include_stage_summaries = request.args.get("stage_summaries", "1") == "1"
+    try:
+        stage_top_n = int(request.args.get("stage_top_n", "10"))
+    except Exception:
+        stage_top_n = 10
+    include_loader_stage = request.args.get("stage_include_loader", "0") == "1"
 
     report_path = run_dir / "report.json"
     report = _safe_read_json(report_path, default={}) if report_path.exists() else {}
@@ -527,6 +843,11 @@ def api_run_detail(run_id):
     # Derive stage_id + process tree
     events, stages = add_stage_ids(raw_events)
     processes, proc_tree = build_process_index(events, stages)
+    # Stage digests (analysis/enrichment layer)
+    stage_summaries = []
+    if include_stage_summaries:
+        stage_summaries = build_stage_summaries(events, stages, top_n=stage_top_n, include_loader=include_loader_stage)
+
 
     # Build a compact timeline for the UI
     timeline = build_compact_timeline(
@@ -585,6 +906,7 @@ def api_run_detail(run_id):
         'categorized_events': categorized,
         'timeline': timeline,
         'stages': stages,
+        'stage_summaries': stage_summaries,
         'processes': processes,
         'process_tree': proc_tree,
         'artifacts': artifacts,
