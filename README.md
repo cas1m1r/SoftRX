@@ -4,6 +4,8 @@
 
 SoftRX was born out of real-world malware research where traditional static analysis and generic sandboxes failed. Instead of trying to *understand everything*, SoftRX is designed to let binaries **betray themselves** — just long enough to expose their payloads, strings, and operational intent.
 
+![dash](dash.png)
+
 ---
 
 ## Philosophy
@@ -43,6 +45,16 @@ At no point is the sample allowed to:
 - delete files
 - execute secondary payloads
 - complete its lifecycle
+
+--- 
+Toggle different variations of permissions to change the runtime behavior and expose/prevent execution
+from doing specific syscalls etc. 
+
+![settings](dynamic_analysis_knobs.png)
+
+After execution, examine the run in detail to see what the software did: 
+
+![analysis](run_detail.png)
 
 ---
 
@@ -85,6 +97,7 @@ SoftRX/
 ```
 
 ---
+
 
 ## Execution Phases
 
