@@ -18,7 +18,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
 #include <string.h>
 
 #include <sys/socket.h>  // msghdr/cmsghdr, CMSG_*, SCM_RIGHTS, SOL_SOCKET, socketpair
@@ -309,14 +308,6 @@ typedef struct taint_node_t {
     struct taint_node_t *next;
 } taint_node_t;
 
-// -------- fd -> target mapping (best-effort, for friendly labels) --------
-typedef struct fd_map_ent_t {
-    pid_t tid;               // thread id from USER_NOTIF (also pid in /proc)
-    int   fd;
-    char  target[PATH_MAX];  // readlink(/proc/<tid>/fd/<fd>)
-} fd_map_ent_t;
-
-
 typedef struct {
     pid_t tracee;
     pid_t tracee_pgid;
@@ -357,13 +348,7 @@ typedef struct {
     struct sock_track_t socks[512];
     int sock_count;
 
-    
-    // FD -> target cache (for labeling reads/writes/closes). Populated lazily via /proc/<tid>/fd/<fd>.
-    fd_map_ent_t *fdmap;
-    size_t fdmap_len;
-    size_t fdmap_cap;
-
-// Quarantine: prevent executing newly written (dropped) files while still tracing.
+    // Quarantine: prevent executing newly written (dropped) files while still tracing.
     bool quarantine_drops;
     taint_node_t *tainted_paths;
 } supervisor_ctx_t;
@@ -613,79 +598,6 @@ static void emit_evt(supervisor_ctx_t *c, const char *event, const char *fmt, ..
     fprintf(c->events_fp, "}\n");
     fflush(c->events_fp);
 }
-
-// ---------- fd mapping helpers (best-effort) ----------
-static const char *fdmap_get(supervisor_ctx_t *c, pid_t tid, int fd) {
-    for (size_t i = 0; i < c->fdmap_len; i++) {
-        if (c->fdmap[i].tid == tid && c->fdmap[i].fd == fd) return c->fdmap[i].target;
-    }
-    return NULL;
-}
-
-static void fdmap_del(supervisor_ctx_t *c, pid_t tid, int fd) {
-    for (size_t i = 0; i < c->fdmap_len; i++) {
-        if (c->fdmap[i].tid == tid && c->fdmap[i].fd == fd) {
-            // swap-remove
-            c->fdmap[i] = c->fdmap[c->fdmap_len - 1];
-            c->fdmap_len--;
-            return;
-        }
-    }
-}
-
-static void fdmap_set(supervisor_ctx_t *c, pid_t tid, int fd, const char *target) {
-    for (size_t i = 0; i < c->fdmap_len; i++) {
-        if (c->fdmap[i].tid == tid && c->fdmap[i].fd == fd) {
-            strncpy(c->fdmap[i].target, target, sizeof(c->fdmap[i].target) - 1);
-            c->fdmap[i].target[sizeof(c->fdmap[i].target) - 1] = '\0';
-            return;
-        }
-    }
-    if (c->fdmap_len == c->fdmap_cap) {
-        size_t newcap = (c->fdmap_cap == 0) ? 256 : (c->fdmap_cap * 2);
-        fd_map_ent_t *p = (fd_map_ent_t*)realloc(c->fdmap, newcap * sizeof(fd_map_ent_t));
-        if (!p) return;
-        c->fdmap = p;
-        c->fdmap_cap = newcap;
-    }
-    c->fdmap[c->fdmap_len].tid = tid;
-    c->fdmap[c->fdmap_len].fd = fd;
-    strncpy(c->fdmap[c->fdmap_len].target, target, sizeof(c->fdmap[c->fdmap_len].target) - 1);
-    c->fdmap[c->fdmap_len].target[sizeof(c->fdmap[c->fdmap_len].target) - 1] = '\0';
-    c->fdmap_len++;
-}
-
-static bool resolve_fd_target(pid_t tid, int fd, char *out, size_t outsz) {
-    char linkpath[128];
-    snprintf(linkpath, sizeof(linkpath), "/proc/%d/fd/%d", (int)tid, fd);
-    ssize_t n = readlink(linkpath, out, (outsz > 0 ? outsz - 1 : 0));
-    if (n <= 0) return false;
-    out[n] = '\0';
-    return true;
-}
-
-
-static void ensure_fd_resolved(supervisor_ctx_t *c, pid_t tid, int fd) {
-    if (fd < 0) return;
-    if (fdmap_get(c, tid, fd)) return;
-
-    char target[PATH_MAX];
-    if (!resolve_fd_target(tid, fd, target, sizeof(target))) return;
-
-    // Cache first, then emit. Emission itself may trigger further lookups.
-    fdmap_set(c, tid, fd, target);
-
-    const char *kind = "other";
-    if (strncmp(target, "socket:[", 8) == 0) kind = "socket";
-    else if (strncmp(target, "pipe:[", 6) == 0) kind = "pipe";
-    else if (strncmp(target, "anon_inode:[", 12) == 0) kind = "anon_inode";
-    else if (target[0] == '/') kind = "file";
-
-    char esc[PATH_MAX * 2];
-    json_escape_to_buf(target, esc, sizeof(esc));
-    emit_evt(c, "fd_open_result", "\"fd\":%d,\"kind\":\"%s\",\"target\":\"%s\"", fd, kind, esc);
-}
-
 
 static int respond_continue_chk(int notify_fd, uint64_t id) {
     struct seccomp_notif_resp resp;
@@ -1095,8 +1007,8 @@ static void handle_exec(supervisor_ctx_t *c, struct seccomp_notif *req) {
     // Allow exactly one initial exec: the target sample itself.
     if (!c->saw_initial_exec && c->sample_abs[0] && strcmp(abs, c->sample_abs) == 0) {
         c->saw_initial_exec = true;
-        emit_evt(c, "exec_allow_initial", "\"abs\":\"%s\"", abs);
-        emit_evt(c, "exec_commit", "\"abs\":\"%s\",\"path\":\"%s\",\"reason\":\"initial\"", abs, path);
+    emit_evt(c, "exec_allow_dev", '"abs":"%s"', abs);
+    emit_evt(c, "exec_commit", '"abs":"%s","path":"%s","reason":"dev"', abs, path);
     c->cache_tid = -1; // comm cache may change after exec
     respond_continue(c->notify_fd, req->id);
     return;
@@ -1488,61 +1400,27 @@ static void handle_mprotect(supervisor_ctx_t *c, struct seccomp_notif *req) {
     respond_continue(c->notify_fd, req->id);
 }
 
-
 static void handle_fd(supervisor_ctx_t *c, struct seccomp_notif *req) {
     int nr = (int)req->data.nr;
     int fd = (int)req->data.args[0];
-    pid_t tid = c->cur_pid;
-
-    // Lazily resolve fd -> target via /proc so UI can show "read libc.so.6" instead of "fd=4".
-    // This is best-effort and does NOT affect the syscall outcome.
-    ensure_fd_resolved(c, tid, fd);
-
-    const char *tgt = fdmap_get(c, tid, fd);
-    char esc[PATH_MAX * 2];
-    if (tgt) json_escape_to_buf(tgt, esc, sizeof(esc));
 
     switch (nr) {
         case __NR_read:
         case __NR_write: {
             size_t cnt = (size_t)req->data.args[2];
-            if (tgt && tgt[0] == '/') {
-                emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
-                         "\"fd\":%d,\"count\":%zu,\"abs\":\"%s\"", fd, cnt, esc);
-            } else if (tgt) {
-                emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
-                         "\"fd\":%d,\"count\":%zu,\"target\":\"%s\"", fd, cnt, esc);
-            } else {
-                emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
-                         "\"fd\":%d,\"count\":%zu", fd, cnt);
-            }
+            emit_evt(c, (nr==__NR_read) ? "fd_read" : "fd_write",
+                     "\"fd\":%d,\"count\":%zu", fd, cnt);
             break;
         }
         case __NR_readv:
         case __NR_writev: {
             int iovcnt = (int)req->data.args[2];
-            if (tgt && tgt[0] == '/') {
-                emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
-                         "\"fd\":%d,\"iovcnt\":%d,\"abs\":\"%s\"", fd, iovcnt, esc);
-            } else if (tgt) {
-                emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
-                         "\"fd\":%d,\"iovcnt\":%d,\"target\":\"%s\"", fd, iovcnt, esc);
-            } else {
-                emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
-                         "\"fd\":%d,\"iovcnt\":%d", fd, iovcnt);
-            }
+            emit_evt(c, (nr==__NR_readv) ? "fd_readv" : "fd_writev",
+                     "\"fd\":%d,\"iovcnt\":%d", fd, iovcnt);
             break;
         }
         case __NR_close:
-            if (tgt && tgt[0] == '/') {
-                emit_evt(c, "fd_close", "\"fd\":%d,\"abs\":\"%s\"", fd, esc);
-            } else if (tgt) {
-                emit_evt(c, "fd_close", "\"fd\":%d,\"target\":\"%s\"", fd, esc);
-            } else {
-                emit_evt(c, "fd_close", "\"fd\":%d", fd);
-            }
-            // prevent FD reuse confusion in later events
-            fdmap_del(c, tid, fd);
+            emit_evt(c, "fd_close", "\"fd\":%d", fd);
             break;
         case __NR_fcntl: {
             long cmd = (long)req->data.args[1];
@@ -1896,10 +1774,7 @@ int main(int argc, char **argv) {
         // Ensure child is reaped if it exited
         (void)kill(child, SIGKILL);
         int st=0; (void)waitpid(child, &st, 0);
-        free(ctx.fdmap);
-    ctx.fdmap = NULL;
-
-    fclose(ctx.events_fp);
+        fclose(ctx.events_fp);
         return 1;
     }
     close(sp[0]);
