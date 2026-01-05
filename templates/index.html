@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="en"><head>
-<meta http-equiv="content-type" content="text/html; charset=UTF-8">
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SoftRX — Sandbox Control Plane</title>
   <style>
     :root {
@@ -215,7 +215,19 @@
     .toast.open { display:block; }
     .toast.ok { border-color: rgba(16,185,129,0.55); }
     .toast.bad { border-color: rgba(239,68,68,0.55); }
-  </style>
+  
+    .chips { display:flex; flex-wrap:wrap; gap:8px; }
+    .chip { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; border:1px solid var(--border); background: rgba(255,255,255,0.03); font-size:12px; }
+    .chip-n { color: var(--muted); font-size:12px; }
+    .finding { padding:10px; border:1px solid var(--border); border-radius: 12px; background: rgba(255,255,255,0.02); cursor:pointer; margin-bottom:8px; }
+    .finding:hover { background: rgba(255,255,255,0.04); }
+    .finding-title { font-weight:600; }
+    .pill { display:inline-block; padding:2px 8px; border-radius: 999px; border:1px solid var(--border); font-size:12px; }
+    .sev-high { border-color: rgba(239,68,68,0.65); }
+    .sev-med { border-color: rgba(245,158,11,0.65); }
+    .sev-low { border-color: rgba(34,197,94,0.55); }
+    .sev-none { border-color: rgba(148,163,184,0.35); }
+</style>
 </head>
 <body>
   <div class="wrap">
@@ -241,12 +253,12 @@
           <div class="row cols2">
             <div>
               <label>Sample</label>
-              <select id="sample-select"><option selected="selected">Loading...</option></select>
+              <select id="sample-select"><option>Loading...</option></select>
               <div class="subtle" style="margin-top:6px;">Uploads are stored in <span class="mono" id="uploads-dir">uploads/</span></div>
             </div>
             <div>
               <label>Sample arguments</label>
-              <input id="sample-args" placeholder="arg1 arg2 ...">
+              <input id="sample-args" placeholder="arg1 arg2 ..." />
               <div class="subtle" style="margin-top:6px;">Split on spaces. Quote handling is minimal (intentionally).</div>
             </div>
           </div>
@@ -257,7 +269,7 @@
             <div>
               <label>Mode</label>
               <select id="mode">
-                <option value="malware" selected="selected">malware (strict)</option>
+                <option value="malware">malware (strict)</option>
                 <option value="re">re (operator-friendly)</option>
                 <option value="reveal-net">reveal-net (show net attempts, cap sends)</option>
                 <option value="dev">dev (max visibility)</option>
@@ -265,11 +277,11 @@
             </div>
             <div>
               <label>Timeout (ms)</label>
-              <input type="number" id="timeout-ms" value="4000" min="100" step="100">
+              <input type="number" id="timeout-ms" value="4000" min="100" step="100" />
             </div>
             <div>
               <label>Max events</label>
-              <input type="number" id="max-events" value="2000" min="1" step="50">
+              <input type="number" id="max-events" value="2000" min="1" step="50" />
             </div>
           </div>
 
@@ -284,14 +296,14 @@
               <div class="row cols2">
                 <div>
                   <label>Write jail (optional)</label>
-                  <input id="write-jail" placeholder="(blank = default outdir/fs for malware/re, backend decides)">
+                  <input id="write-jail" placeholder="(blank = default outdir/fs for malware/re, backend decides)" />
                   <div class="subtle" style="margin-top:6px;">If blank: malware/re default to <span class="mono">outdir/fs</span>. Reveal-net ignores writes. Dev auto-picks <span class="mono">outdir/fs</span>.</div>
                 </div>
                 <div>
                   <label>Policy toggles</label>
                   <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                    <label class="pill"><input type="checkbox" id="quarantine" checked="checked" style="width:auto; margin-right:6px;">quarantine drops</label>
-                    <label class="pill"><input type="checkbox" id="interactive-fs" style="width:auto; margin-right:6px;">interactive-fs</label>
+                    <label class="pill"><input type="checkbox" id="quarantine" checked style="width:auto; margin-right:6px;" />quarantine drops</label>
+                    <label class="pill"><input type="checkbox" id="interactive-fs" style="width:auto; margin-right:6px;" />interactive-fs</label>
                   </div>
                   <div class="subtle" style="margin-top:6px;">Quarantine prevents executing newly written (tainted) files. Interactive-fs prompts on writes inside jail (terminal required).</div>
                 </div>
@@ -308,9 +320,9 @@
             </button>
             <div class="body">
               <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
-                <label class="pill"><input type="checkbox" id="allow-dns" checked="checked" style="width:auto; margin-right:6px;">allow DNS (53)</label>
-                <label class="pill"><input type="checkbox" id="allow-dot" checked="checked" style="width:auto; margin-right:6px;">allow DoT (853)</label>
-                <label class="pill"><input type="checkbox" id="deny-unlisted" style="width:auto; margin-right:6px;">deny-unlisted</label>
+                <label class="pill"><input type="checkbox" id="allow-dns" checked style="width:auto; margin-right:6px;" />allow DNS (53)</label>
+                <label class="pill"><input type="checkbox" id="allow-dot" checked style="width:auto; margin-right:6px;" />allow DoT (853)</label>
+                <label class="pill"><input type="checkbox" id="deny-unlisted" style="width:auto; margin-right:6px;" />deny-unlisted</label>
               </div>
 
               <div class="row cols2">
@@ -324,15 +336,15 @@
                   <div class="row cols3">
                     <div>
                       <label>bytes</label>
-                      <input type="number" id="net-cap-bytes" value="10240" min="0" step="256">
+                      <input type="number" id="net-cap-bytes" value="10240" min="0" step="256" />
                     </div>
                     <div>
                       <label>ms</label>
-                      <input type="number" id="net-cap-ms" value="2000" min="0" step="250">
+                      <input type="number" id="net-cap-ms" value="2000" min="0" step="250" />
                     </div>
                     <div>
                       <label>sends</label>
-                      <input type="number" id="net-cap-sends" value="32" min="0" step="1">
+                      <input type="number" id="net-cap-sends" value="32" min="0" step="1" />
                     </div>
                   </div>
                   <div class="subtle" style="margin-top:6px;">Set to 0 to disable a cap. Caps are enforced by the C backend. Socket stats are dumped in <span class="mono">dump_sockmap.json</span> on snapshot.</div>
@@ -352,11 +364,11 @@
               <div class="row cols2">
                 <div>
                   <label>Launcher path</label>
-                  <input id="launcher" placeholder="bin/softrx_launcher">
+                  <input id="launcher" placeholder="bin/softrx_launcher" />
                 </div>
                 <div>
                   <label>Runs dir</label>
-                  <input id="runs-dir" placeholder="softrx_runs">
+                  <input id="runs-dir" placeholder="softrx_runs" />
                 </div>
               </div>
             </div>
@@ -389,12 +401,12 @@
         <div class="row cols2" style="margin-bottom: 12px;">
           <div>
             <label>Search (sample / run id)</label>
-            <input id="run-search" placeholder="type to filter" oninput="renderRuns()">
+            <input id="run-search" placeholder="type to filter" oninput="renderRuns()" />
           </div>
           <div>
             <label>Mode filter</label>
             <select id="mode-filter" onchange="renderRuns()">
-              <option value="" selected="selected">(all)</option>
+              <option value="">(all)</option>
               <option value="malware">malware</option>
               <option value="re">re</option>
               <option value="reveal-net">reveal-net</option>
@@ -415,7 +427,7 @@
         <h2>Upload sample</h2>
         <div class="subtle">Files are saved to the server upload directory and auto-marked executable.</div>
         <div class="divider"></div>
-        <input type="file" id="file-input">
+        <input type="file" id="file-input" />
         <div style="height:10px"></div>
         <button class="btn primary" onclick="uploadFile()">⬆️ Upload</button>
         <div id="upload-result" class="subtle" style="margin-top: 10px;"></div>
@@ -449,7 +461,7 @@
     </div>
   </div>
 
-  <div class="toast" id="toast">Debug failed: JSON.parse: unexpected character at line 1 column 1 of the JSON data</div>
+  <div class="toast" id="toast"></div>
 
   <script>
     let config = null;
@@ -681,7 +693,7 @@
       document.getElementById('modal-body').innerHTML = '<div class="subtle">Loading…</div>';
 
       try {
-        const r = await fetch(`/api/run/${encodeURIComponent(runId)}?${_qsFromOpts(window.__runState.opts)}`);
+        const r = await fetch(`/api/run/${encodeURIComponent(runId)}`);
         const data = await r.json();
         if (data.error) throw new Error(data.error);
         renderRunModal(data);
@@ -703,9 +715,10 @@
 
       const tabs = [
         { id: 'overview', label: 'Overview' },
-        { id: 'timeline', label: `Timeline (${(summary.timeline_count ?? summary.event_count ?? (data.timeline ? data.timeline.length : 0) ?? (report.event_count||0))})` },
+        { id: 'timeline', label: `Timeline (${summary.event_count || (report.event_count||0)})` },
         { id: 'artifacts', label: `Artifacts (${(data.artifacts||[]).length})` },
         { id: 'snapshots', label: `Snapshots (${(data.snapshots||[]).length})` },
+        { id: 'insights', label: `Insights (${((data.insights && data.insights.findings)||[]).length})` },
         { id: 'raw', label: 'Raw JSON' },
       ];
 
@@ -715,6 +728,7 @@
           ${tabs.map((t, i) => `<button class="inner-tab ${i===0?'active':''}" data-inner="${t.id}" onclick="innerTab('${t.id}')">${escapeHtml(t.label)}</button>`).join('')}
         </div>
         <div id="inner-overview"></div>
+        <div id="inner-insights" style="display:none;"></div>
         <div id="inner-timeline" style="display:none;"></div>
         <div id="inner-artifacts" style="display:none;"></div>
         <div id="inner-snapshots" style="display:none;"></div>
@@ -722,6 +736,7 @@
       `;
 
       renderOverview(data);
+      renderInsights(data);
       renderTimeline(data);
       renderArtifacts(data);
       renderSnapshots(data);
@@ -732,7 +747,7 @@
       document.querySelectorAll('.inner-tab').forEach(b => b.classList.remove('active'));
       document.querySelector(`.inner-tab[data-inner="${id}"]`).classList.add('active');
 
-      const sections = ['overview','timeline','artifacts','snapshots','raw'];
+      const sections = ['overview','insights','timeline','artifacts','snapshots','raw'];
       for (const s of sections) {
         document.getElementById(`inner-${s}`).style.display = (s === id) ? 'block' : 'none';
       }
@@ -755,7 +770,166 @@
               <span class="pill">fs=${summary.fs ?? 0}</span>
               <span class="pill">net=${summary.net ?? 0}</span>
               <span class="pill">proc=${summary.proc ?? 0}</span>
-              <span class="pill">mprotect=${summary.mprotect ?? 0}</span>
+              <span class="pill">mprotect=${su
+    function renderInsights(data) {
+      const el = document.getElementById('inner-insights');
+      const insights = data.insights || null;
+      if (!insights) {
+        
+      const storyStages = (insights.story_mode || []);
+      const storyHtml = storyStages.length
+        ? storyStages.map(st => {
+            const hdr = `stage ${escapeHtml(st.stage_id)} • pid ${escapeHtml(String(st.pid ?? ""))} • ${escapeHtml(String(st.comm ?? ""))}`;
+            const lines = (st.lines || []).map(line => `<li>${escapeHtml(line)}</li>`).join("");
+            return `<div style="margin:0 0 10px 0;">
+                      <div class="subtle" style="margin:0 0 4px 0;">${hdr}</div>
+                      <ul style="margin:0 0 0 18px; padding:0;">${lines}</ul>
+                    </div>`;
+          }).join("")
+        : `<div class="subtle">No story-mode summary yet.</div>`;
+
+      const netRows = (insights.net_summary || []);
+      const netHtml = netRows.length
+        ? `<div style="overflow:auto; max-height:240px;">
+             <table style="width:100%; border-collapse:collapse;">
+               <thead>
+                 <tr>
+                   <th style="text-align:left; padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.08);">dst</th>
+                   <th style="text-align:right; padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.08);">connect</th>
+                   <th style="text-align:right; padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.08);">send</th>
+                   <th style="text-align:right; padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.08);">bytes</th>
+                   <th style="text-align:right; padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.08);">denied</th>
+                 </tr>
+               </thead>
+               <tbody>
+                 ${netRows.map(r => {
+                    const dst = escapeHtml(String(r.dst ?? ""));
+                    const c = escapeHtml(String(r.connect ?? 0));
+                    const s = escapeHtml(String(r.send ?? 0));
+                    const b = escapeHtml(String(r.send_bytes ?? 0));
+                    const d = escapeHtml(String(r.denied ?? 0));
+                    return `<tr>
+                              <td style="padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.05);">${dst}</td>
+                              <td style="padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.05); text-align:right;">${c}</td>
+                              <td style="padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.05); text-align:right;">${s}</td>
+                              <td style="padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.05); text-align:right;">${b}</td>
+                              <td style="padding:6px 4px; border-bottom:1px solid rgba(255,255,255,0.05); text-align:right;">${d}</td>
+                            </tr>`;
+                 }).join("")}
+               </tbody>
+             </table>
+           </div>`
+        : `<div class="subtle">No network destinations captured.</div>`;
+      el.innerHTML = `
+              <div>
+                <div class="grid two" style="gap:12px;">
+                  <div class="card">
+                    <h3>Insights</h3>
+                    <div class="subtle">Max severity: <span class="pill ${sevClass(maxSev)}">${escapeHtml(String(maxSev).toUpperCase())}</span></div>
+                    <div style="margin-top:10px;">
+                      <div class="subtle" style="margin-bottom:6px;">Intent tags</div>
+                      <div class="chips">${tagHtml}</div>
+                    </div>
+                  </div>
+                  <div class="card">
+                    <h3>Findings</h3>
+                    ${findingsHtml}
+                    <div class="subtle" style="margin-top:10px;">Click a finding to jump/filter.</div>
+                  </div>
+                </div>
+      
+                <div class="grid two" style="gap:12px; margin-top:12px;">
+                  <div class="card">
+                    <h3>Story mode</h3>
+                    ${storyHtml}
+                  </div>
+                  <div class="card">
+                    <h3>Network destinations</h3>
+                    ${netHtml}
+                  </div>
+                </div>
+              </div>
+            `;        return;
+      }
+
+      const maxSev = insights.max_severity || 'none';
+      const tags = insights.intent_tags || [];
+      const findings = insights.findings || [];
+
+      const sevClass = (s) => {
+        s = String(s||'').toLowerCase();
+        if (s === 'high' || s === 'critical') return 'sev-high';
+        if (s === 'medium') return 'sev-med';
+        if (s === 'low') return 'sev-low';
+        return 'sev-none';
+      };
+
+      const tagHtml = tags.length
+        ? tags.map(t => `<span class="chip ${sevClass(t.severity)}" title="${escapeHtml(t.tag)}">${escapeHtml(t.tag)}${t.count ? ` <span class="chip-n">(${t.count})</span>` : ''}</span>`).join(' ')
+        : `<span class="subtle">No intent tags.</span>`;
+
+      const findingsHtml = findings.length
+        ? `<div class="findings">
+            ${findings.map((f, i) => `
+              <div class="finding ${sevClass(f.severity)}" data-find="${i}">
+                <div class="finding-title">${escapeHtml(f.title || 'Finding')}</div>
+                <div class="finding-meta subtle">
+                  ${(f.severity||'').toUpperCase()}${f.stage_id ? ` • stage ${escapeHtml(f.stage_id)}` : ''}${f.pid ? ` • pid ${escapeHtml(String(f.pid))}` : ''}
+                </div>
+              </div>
+            `).join('')}
+          </div>`
+        : `<div class="subtle">No findings.</div>`;
+
+      el.innerHTML = `
+        <div class="grid two" style="gap:12px;">
+          <div class="card">
+            <h3>Insights</h3>
+            <div class="subtle">Max severity: <span class="pill ${sevClass(maxSev)}">${escapeHtml(String(maxSev).toUpperCase())}</span></div>
+            <div style="margin-top:10px;">
+              <div class="subtle" style="margin-bottom:6px;">Intent tags</div>
+              <div class="chips">${tagHtml}</div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Findings</h3>
+            ${findingsHtml}
+            <div class="subtle" style="margin-top:10px;">Click a finding to jump/filter.</div>
+          </div>
+        </div>
+      `;
+
+      // Click -> set filters and switch to Timeline
+      el.querySelectorAll('.finding').forEach(node => {
+        node.addEventListener('click', () => {
+          const idx = parseInt(node.getAttribute('data-find') || '0', 10);
+          const f = findings[idx] || {};
+          try {
+            if (f.pid) {
+              const sel = document.getElementById('filter-proc');
+              if (sel) sel.value = String(f.pid);
+            }
+            if (f.stage_id) {
+              const selS = document.getElementById('filter-stage');
+              if (selS) selS.value = String(f.stage_id);
+            }
+            // If we have an event index, try to select it after filtering.
+            if (typeof filterEvents === 'function') filterEvents();
+            if (typeof selectEvent === 'function' && (f.idx !== undefined && f.idx !== null)) {
+              // selectEvent expects filtered index; we can fall back to selecting first match.
+              // For simplicity: select first row after filtering.
+              selectEvent(0);
+            }
+            innerTab('timeline');
+          } catch (e) {
+            console.warn('finding jump failed', e);
+          }
+        });
+      });
+    }
+
+
+    mmary.mprotect ?? 0}</span>
               <span class="pill ${summary.drops ? 'warn':''}">drops=${summary.drops ?? 0}</span>
               <span class="pill ${summary.policy ? 'warn':''}">policy=${summary.policy ?? 0}</span>
             </div>
@@ -775,92 +949,29 @@
       `;
     }
 
-    
-    // -------- Enriched runtime UI (process tree + stages + compact timeline) --------
-    window.__runState = window.__runState || { runId: null, opts: { hide_mem: true, collapse_loader: true, group_fd: true } };
-    window.__filters = window.__filters || { pid: null, stage_id: null };
-
-    function _qsFromOpts(opts) {
-      const p = new URLSearchParams();
-      p.set('hide_mem', opts.hide_mem ? '1' : '0');
-      p.set('collapse_loader', opts.collapse_loader ? '1' : '0');
-      p.set('group_fd', opts.group_fd ? '1' : '0');
-      return p.toString();
-    }
-
-    async function refetchRunWithOpts() {
-      const st = window.__runState;
-      if (!st.runId) return;
-      const qs = _qsFromOpts(st.opts);
-      const r = await fetch(`/api/run/${encodeURIComponent(st.runId)}?${qs}`);
-      const data = await r.json();
-      if (data.error) throw new Error(data.error);
-      // Re-render only timeline (keeps other tabs intact)
-      renderTimeline(data);
-      // Keep summary badges roughly correct
-      try { renderOverview(data); } catch (_) {}
-    }
-
     function renderTimeline(data) {
       const report = data.report || {};
-      const timeline = (data.timeline || (report.events || []));
-      const processes = (data.processes || []);
-      const procTree = (data.process_tree || []);
-      const stages = (data.stages || []);
+      const events = (report.events || []);
       const wrap = document.getElementById('inner-timeline');
 
-      if (!timeline.length) {
+      if (!events.length) {
         wrap.innerHTML = '<div class="subtle">No events recorded.</div>';
         return;
       }
 
-      // Persist run id for toggle-driven refetches
-      window.__runState.runId = data.run_id;
+      // Build list of distinct event names
+      const names = Array.from(new Set(events.map(e => e.event || ''))).sort();
+      const options = ['(all)', ...names].map(n => `<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`).join('');
 
-      // Build process dropdown options
-      const procSorted = [...processes].sort((a,b) => (a.pid||0) - (b.pid||0));
-      const procOptions = ['<option value="">(all processes)</option>'].concat(
-        procSorted.map(p => `<option value="${p.pid}">${p.pid} · ${escapeHtml(p.comm || 'unknown')}</option>`)
-      ).join('');
-
-      // Build stage dropdown options (scoped by pid if selected)
-      const pidFilter = window.__filters.pid;
-      const stageList = stages
-        .filter(s => !pidFilter || String(s.pid) === String(pidFilter))
-        .sort((a,b) => (a.pid-b.pid) || String(a.stage_id).localeCompare(String(b.stage_id)));
-
-      const stageOptions = ['<option value="">(all stages)</option>'].concat(
-        stageList.map(st => {
-          const label = `${st.stage_id}${st.exec_abs ? ' · ' + st.exec_abs.split('/').slice(-1)[0] : ''}`;
-          return `<option value="${escapeAttr(st.stage_id)}">${escapeHtml(label)}</option>`;
-        })
-      ).join('');
-
-      // Build list of distinct event names from current timeline
-      const names = Array.from(new Set(timeline.map(e => e.event || ''))).sort();
-      const typeOptions = ['(all)', ...names].map(n => `<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`).join('');
-
-      // Controls / layout
       wrap.innerHTML = `
         <div class="row cols3" style="margin-bottom:10px;">
           <div>
             <label>Search</label>
-            <input id="evt-search" placeholder="path / dst / label / json" oninput="filterEvents()" />
+            <input id="evt-search" placeholder="path / dst / event" oninput="filterEvents()" />
           </div>
-          <div>
-            <label>Process</label>
-            <select id="evt-pid" onchange="setPidFilter(this.value)">${procOptions}</select>
-          </div>
-          <div>
-            <label>Stage</label>
-            <select id="evt-stage" onchange="setStageFilter(this.value)">${stageOptions}</select>
-          </div>
-        </div>
-
-        <div class="row cols3" style="margin-bottom:10px;">
           <div>
             <label>Event type</label>
-            <select id="evt-type" onchange="filterEvents()">${typeOptions}</select>
+            <select id="evt-type" onchange="filterEvents()">${options}</select>
           </div>
           <div>
             <label>Quick toggles</label>
@@ -869,210 +980,53 @@
               <label class="pill"><input type="checkbox" id="evt-net" style="width:auto; margin-right:6px;" onchange="filterEvents()" />net-only</label>
             </div>
           </div>
-          <div>
-            <label>Noise controls (server)</label>
-            <div style="display:flex; gap:10px; flex-wrap:wrap;">
-              <label class="pill"><input type="checkbox" id="opt-hide-mem" style="width:auto; margin-right:6px;" />hide mem</label>
-              <label class="pill"><input type="checkbox" id="opt-collapse-loader" style="width:auto; margin-right:6px;" />collapse loader</label>
-              <label class="pill"><input type="checkbox" id="opt-group-fd" style="width:auto; margin-right:6px;" />group reads</label>
-            </div>
-            <div class="subtle" style="margin-top:6px;">These re-fetch the run with different server-side compaction options.</div>
-          </div>
         </div>
-
         <div class="grid two">
           <div class="card" style="padding:14px;">
-            <h2>Process tree + stages</h2>
-            <div class="subtle">Click a process/stage to filter the timeline. These come from pid/ppid + derived stage_id boundaries.</div>
-            <div class="divider"></div>
-            <div class="row cols2">
-              <div>
-                <div class="subtle" style="margin-bottom:6px;">Process tree</div>
-                <div class="code mono" style="max-height: 200px;" id="proc-tree"></div>
-              </div>
-              <div>
-                <div class="subtle" style="margin-bottom:6px;">Stages</div>
-                <div style="max-height: 200px; overflow:auto;" id="stage-list"></div>
-              </div>
-            </div>
-
-            <div class="divider"></div>
-
             <h2>Timeline (ordered)</h2>
             <div class="subtle">Click any row to inspect full JSON event.</div>
             <div class="divider"></div>
-            <div style="max-height: 45vh; overflow:auto;">
+            <div style="max-height: 55vh; overflow:auto;">
               <table>
                 <thead>
                   <tr>
                     <th>#</th>
                     <th>ts_ms</th>
-                    <th>pid</th>
-                    <th>stage</th>
                     <th>event</th>
-                    <th>label</th>
+                    <th>detail</th>
                   </tr>
                 </thead>
                 <tbody id="evt-body"></tbody>
               </table>
             </div>
           </div>
-
           <div class="card" style="padding:14px;">
             <h2>Inspector</h2>
             <div class="subtle">Selected event JSON</div>
             <div class="divider"></div>
             <div class="code mono" id="evt-json">(select an event)</div>
-            <div class="divider"></div>
-            <button class="btn" onclick="downloadNdjson()">⬇️ Download raw events.ndjson</button>
           </div>
         </div>
       `;
 
-      // Wire server-side noise controls
-      const st = window.__runState;
-      const hideCb = document.getElementById('opt-hide-mem');
-      const collCb = document.getElementById('opt-collapse-loader');
-      const groupCb = document.getElementById('opt-group-fd');
-      hideCb.checked = !!st.opts.hide_mem;
-      collCb.checked = !!st.opts.collapse_loader;
-      groupCb.checked = !!st.opts.group_fd;
-
-      function _onOptChange() {
-        st.opts.hide_mem = !!hideCb.checked;
-        st.opts.collapse_loader = !!collCb.checked;
-        st.opts.group_fd = !!groupCb.checked;
-        refetchRunWithOpts().catch(e => toast('Refetch failed: ' + e.message, 'bad'));
-      }
-      hideCb.onchange = _onOptChange;
-      collCb.onchange = _onOptChange;
-      groupCb.onchange = _onOptChange;
-
-      window.__lastProcTree = procTree;
-      window.__lastStages = stageList;
-
-      // Render process tree + stages
-      renderProcessTree(procTree);
-      renderStages(stageList);
-
       // Store for filtering
-      window.__events = timeline;
-
-      // Apply persisted filters to dropdowns
-      document.getElementById('evt-pid').value = (window.__filters.pid ?? '') === null ? '' : String(window.__filters.pid ?? '');
-      document.getElementById('evt-stage').value = (window.__filters.stage_id ?? '') === null ? '' : String(window.__filters.stage_id ?? '');
-
-      // Initial render
-      const filtered = filterEvents();
-      if (filtered.length) selectEvent(filtered[0].idx ?? filtered[0].ts_ms ?? 0);
-      else selectEvent((timeline[0].idx ?? 0));
-    }
-
-    function downloadNdjson() {
-      const st = window.__runState;
-      if (!st.runId) return;
-      window.open(`/api/run/${encodeURIComponent(st.runId)}/events`, '_blank');
-    }
-
-    function setPidFilter(pid) {
-      window.__filters.pid = pid ? parseInt(pid, 10) : null;
-      window.__filters.stage_id = null; // reset stage when switching pid
-      refreshStageOptions();
-      // Sync UI if present
-      const stageSel = document.getElementById('evt-stage');
-      if (stageSel) stageSel.value = '';
+      window.__events = events;
       filterEvents();
+      selectEvent(0);
     }
 
-    function setStageFilter(stageId) {
-      window.__filters.stage_id = stageId ? String(stageId) : null;
-      filterEvents();
-    }
-function refreshStageOptions() {
-      const stageSel = document.getElementById('evt-stage');
-      if (!stageSel) return;
-      const pidFilter = window.__filters.pid;
-      const stages = window.__lastStages || [];
-      const stageList = stages
-        .filter(s => !pidFilter || String(s.pid) === String(pidFilter))
-        .sort((a,b) => (a.pid-b.pid) || String(a.stage_id).localeCompare(String(b.stage_id)));
-
-      const opts = ['<option value="">(all stages)</option>'].concat(
-        stageList.map(st => {
-          const label = `${st.stage_id}${st.exec_abs ? ' · ' + st.exec_abs.split('/').slice(-1)[0] : ''}`;
-          return `<option value="${escapeAttr(st.stage_id)}">${escapeHtml(label)}</option>`;
-        })
-      ).join('');
-      stageSel.innerHTML = opts;
-    }
-
-
-    function renderProcessTree(procTree) {
-      const el = document.getElementById('proc-tree');
-      if (!el) return;
-      if (!procTree || !procTree.length) {
-        el.textContent = '(no process tree data)';
-        return;
-      }
-      el.innerHTML = _procTreeToHtml(procTree, 0);
-    }
-
-    function _procTreeToHtml(nodes, depth) {
-      return (nodes || []).map(n => {
-        const pid = n.pid;
-        const comm = n.comm || 'unknown';
-        const active = (window.__filters.pid !== null && String(window.__filters.pid) === String(pid));
-        const pad = ' '.repeat(depth * 2);
-        const line = `${pad}${pid} ${comm}`;
-        const btn = `<div class="evt" style="padding:4px 6px; border-radius:10px; ${active ? 'background: rgba(0,212,255,0.10); border: 1px solid rgba(0,212,255,0.25);' : ''}" onclick="setPidFilter('${pid}'); document.getElementById('evt-pid').value='${pid}'; filterEvents();">${escapeHtml(line)}</div>`;
-        const kids = (n.children && n.children.length) ? _procTreeToHtml(n.children, depth + 1) : '';
-        return btn + kids;
-      }).join('');
-    }
-
-    function renderStages(stages) {
-      const el = document.getElementById('stage-list');
-      if (!el) return;
-      if (!stages || !stages.length) {
-        el.innerHTML = '<div class="subtle">(no stage data)</div>';
-        return;
-      }
-
-      // Group by pid for readability
-      const byPid = {};
-      for (const s of stages) {
-        const pid = s.pid ?? -1;
-        if (window.__filters.pid && String(pid) !== String(window.__filters.pid)) continue;
-        (byPid[pid] = byPid[pid] || []).push(s);
-      }
-      const pids = Object.keys(byPid).map(x => parseInt(x, 10)).sort((a,b) => a-b);
-
-      let html = '';
-      for (const pid of pids) {
-        html += `<div class="subtle" style="margin: 6px 0;">pid ${pid}</div>`;
-        html += `<div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">`;
-        for (const st of byPid[pid]) {
-          const active = (window.__filters.stage_id && String(window.__filters.stage_id) === String(st.stage_id));
-          const label = (st.exec_abs ? st.exec_abs.split('/').slice(-1)[0] : st.stage_id);
-          html += `<button class="inner-tab ${active ? 'active' : ''}" style="cursor:pointer;" onclick="setPidFilter('${pid}'); document.getElementById('evt-pid').value='${pid}'; setStageFilter('${escapeAttr(st.stage_id)}'); document.getElementById('evt-stage').value='${escapeAttr(st.stage_id)}'; filterEvents();">${escapeHtml(label)}</button>`;
-        }
-        html += `</div>`;
-      }
-      el.innerHTML = html || '<div class="subtle">(no stages match current filter)</div>';
-    }
-
-    function eventLabel(ev) {
-      if (!ev) return '';
-      if (ev.label) return String(ev.label);
-      // fallback: previous heuristic
+    function eventDetail(ev) {
       const keys = ['abs','path','dst','old','new','why','fd','len','flags','addr','cmd'];
       for (const k of keys) {
         if (ev[k] !== undefined) return `${k}=${ev[k]}`;
       }
+      // fallback: show a compact subset
       const clone = {...ev};
-      delete clone.idx; delete clone.ts_ms; delete clone.event;
+      delete clone.idx;
+      delete clone.ts_ms;
+      delete clone.event;
       const s = JSON.stringify(clone);
-      return s.length > 90 ? (s.slice(0, 87) + '…') : s;
+      return s.length > 80 ? (s.slice(0, 77) + '…') : s;
     }
 
     function filterEvents() {
@@ -1081,19 +1035,12 @@ function refreshStageOptions() {
       const policyOnly = document.getElementById('evt-policy').checked;
       const netOnly = document.getElementById('evt-net').checked;
 
-      const pidFilter = window.__filters.pid;
-      const stageFilter = window.__filters.stage_id;
-
       const evs = window.__events || [];
       const tbody = document.getElementById('evt-body');
 
       const filtered = evs.filter(ev => {
         const et = String(ev.event || '');
         if (t && t !== '(all)' && et !== t) return false;
-
-        if (pidFilter !== null && String(ev.pid) !== String(pidFilter)) return false;
-        if (stageFilter !== null && String(ev.stage_id || '') !== String(stageFilter)) return false;
-
         if (policyOnly) {
           const e = et.toLowerCase();
           if (!(e.startsWith('tripwire') || ['hard_kill','snapshot','timeout_halt','max_events_halt'].includes(e))) return false;
@@ -1102,39 +1049,29 @@ function refreshStageOptions() {
           if (!String(et).toLowerCase().startsWith('net_')) return false;
         }
         if (!q) return true;
-        const blob = (eventLabel(ev) + ' ' + JSON.stringify(ev)).toLowerCase();
+        const blob = JSON.stringify(ev).toLowerCase();
         return blob.includes(q);
       });
 
       tbody.innerHTML = '';
-      filtered.slice(0, 4000).forEach(ev => {
+      filtered.slice(0, 3000).forEach(ev => {
         const tr = document.createElement('tr');
         tr.className = 'evt';
         tr.onclick = () => selectEvent(ev.idx ?? 0);
         tr.innerHTML = `
           <td class="mono">${ev.idx ?? ''}</td>
           <td class="mono">${escapeHtml(String(ev.ts_ms ?? ''))}</td>
-          <td class="mono">${escapeHtml(String(ev.pid ?? ''))} ${escapeHtml(ev.comm ? ('· ' + ev.comm) : '')}</td>
-          <td class="mono">${escapeHtml(String(ev.stage_id ?? ''))}</td>
           <td class="mono">${escapeHtml(String(ev.event || ''))}</td>
-          <td>${escapeHtml(eventLabel(ev))}</td>
+          <td>${escapeHtml(eventDetail(ev))}</td>
         `;
         tbody.appendChild(tr);
       });
-
-      // Re-render highlights for tree/stage
-      try {
-        renderProcessTree(window.__lastProcTree || []);
-      } catch (_) {}
-
-      return filtered;
     }
 
     function selectEvent(idx) {
       const evs = window.__events || [];
       const ev = evs.find(e => (e.idx ?? 0) === idx) || evs[0];
-      const out = document.getElementById('evt-json');
-      if (out) out.textContent = JSON.stringify(ev, null, 2);
+      document.getElementById('evt-json').textContent = JSON.stringify(ev, null, 2);
     }
 
     function renderArtifacts(data) {
@@ -1266,5 +1203,5 @@ function refreshStageOptions() {
       loadDebug();
     });
   </script>
-
-</body></html>
+</body>
+</html>

@@ -38,6 +38,42 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 
+// ---- Compat: openat2 + seccomp NOTIF_ADDFD (older headers on some distros) ----
+#ifndef __NR_openat2
+// x86_64 openat2 syscall number
+#define __NR_openat2 437
+#endif
+
+#ifndef RESOLVE_BENEATH
+// Minimal subset of linux/openat2.h UAPI
+struct open_how {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
+};
+#define RESOLVE_NO_XDEV       0x01
+#define RESOLVE_NO_MAGICLINKS 0x02
+#define RESOLVE_NO_SYMLINKS   0x04
+#define RESOLVE_BENEATH       0x08
+#define RESOLVE_IN_ROOT       0x10
+#define RESOLVE_CACHED        0x20
+#endif
+
+#ifndef SECCOMP_IOCTL_NOTIF_ADDFD
+// UAPI values from linux/seccomp.h
+struct seccomp_notif_addfd {
+    __u64 id;
+    __u32 flags;
+    __u32 srcfd;
+    __u32 newfd;
+    __u32 newfd_flags;
+};
+#ifndef SECCOMP_ADDFD_FLAG_SEND
+#define SECCOMP_ADDFD_FLAG_SEND 0x01
+#endif
+#define SECCOMP_IOCTL_NOTIF_ADDFD _IOW('!', 7, struct seccomp_notif_addfd)
+#endif
+
 #include <time.h>
 #include <unistd.h>
 
@@ -321,6 +357,7 @@ typedef struct {
     int notify_fd;
     char outdir[4096];
     char write_jail[4096];
+    int  jail_root_fd;         // O_PATH|O_DIRECTORY fd for write-jail root (or -1)
     bool interactive_fs;
     run_mode_t mode;
     uint64_t timeout_ms;
@@ -677,6 +714,7 @@ static int install_listener_filter(void) {
         LOAD_SYSCALL_NR,
 
         JEQ_SYSCALL(__NR_mprotect, 0, 1), BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
+        JEQ_SYSCALL(__NR_mmap,    0, 1), BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
 
         JEQ_SYSCALL(__NR_openat, 0, 1),  BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
         JEQ_SYSCALL(__NR_open, 0, 1),    BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
@@ -710,8 +748,8 @@ static int install_listener_filter(void) {
         JEQ_SYSCALL(__NR_close,0, 1),    BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
         JEQ_SYSCALL(__NR_poll,0, 1),     BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
         JEQ_SYSCALL(__NR_ppoll,0, 1),    BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
-        JEQ_SYSCALL(__NR_write,0, 1),    BPF_STMT(BPF_RET|BPF_K, SC_ALLOW),
-        JEQ_SYSCALL(__NR_writev,0, 1),   BPF_STMT(BPF_RET|BPF_K, SC_ALLOW),
+        JEQ_SYSCALL(__NR_write,0, 1),    BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
+        JEQ_SYSCALL(__NR_writev,0, 1),   BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
         JEQ_SYSCALL(__NR_bind,0, 1),     BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
         JEQ_SYSCALL(__NR_listen,0, 1),   BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
         JEQ_SYSCALL(__NR_recvfrom,0, 1), BPF_STMT(BPF_RET|BPF_K, SC_NOTIFY),
@@ -785,18 +823,96 @@ static bool is_write_flags(int flags) {
     return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0;
 }
 
-static void handle_open_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
-    int nr = req->data.nr;
+static int open_under_jail(supervisor_ctx_t *c, const char *abs, int flags, mode_t mode) {
+    if (!c || c->jail_root_fd < 0 || !abs || !abs[0]) { errno = EPERM; return -1; }
 
+    // Ensure abs is within jail (lexical check). openat2 will enforce resolution constraints.
+    size_t jl = strlen(c->write_jail);
+    if (jl == 0) { errno = EPERM; return -1; }
+
+    if (strncmp(abs, c->write_jail, jl) != 0 || (abs[jl] != '\0' && abs[jl] != '/')) {
+        errno = EPERM;
+        return -1;
+    }
+
+    const char *rel = abs + jl;
+    if (*rel == '/') rel++;
+    if (*rel == '\0') { errno = EISDIR; return -1; }
+
+    struct open_how how;
+    memset(&how, 0, sizeof(how));
+    how.flags = (uint64_t)flags;
+    how.mode  = (uint64_t)mode;
+    // Keep resolution confined beneath jail_root_fd and avoid /proc magic-links.
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS;
+    if (c->mode == MODE_MALWARE || c->mode == MODE_REVEAL_NET) {
+        // Optional strictness: uncomment to forbid symlinks entirely.
+        // how.resolve |= RESOLVE_NO_SYMLINKS;
+    }
+
+    int fd = (int)syscall(__NR_openat2, c->jail_root_fd, rel, &how, sizeof(how));
+    if (fd >= 0) return fd;
+
+    if (errno == ENOSYS) {
+        // Fallback (best-effort): prevent final component symlink.
+        int f = flags | O_NOFOLLOW;
+        return openat(c->jail_root_fd, rel, f, mode);
+    }
+
+    return -1;
+}
+
+static int inject_fd_and_respond(int notify_fd, uint64_t req_id, int localfd, int open_flags) {
+    struct seccomp_notif_addfd add;
+    memset(&add, 0, sizeof(add));
+    add.id = req_id;
+    add.flags = SECCOMP_ADDFD_FLAG_SEND;
+    add.srcfd = (uint32_t)localfd;
+    add.newfd = 0; // let kernel choose
+    add.newfd_flags = (open_flags & O_CLOEXEC) ? (uint32_t)O_CLOEXEC : 0;
+
+    int r = ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &add);
+    if (r >= 0) {
+        // With SECCOMP_ADDFD_FLAG_SEND the response is sent atomically.
+        return 0;
+    }
+
+    // Some kernels/headers may not support SEND; retry without it and manually respond.
+    if (errno == EINVAL) {
+        add.flags = 0;
+        r = ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &add);
+        if (r < 0) return -errno;
+
+        struct seccomp_notif_resp resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.id = req_id;
+        resp.val = (int64_t)r;
+        resp.error = 0;
+        resp.flags = 0;
+        if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) != 0) return -errno;
+        return 0;
+    }
+
+    return -errno;
+}
+
+static void handle_open_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
+    int nr = (int)req->data.nr;
+
+    int dirfd = AT_FDCWD;
     uint64_t pathptr = 0;
     int flags = 0;
+    mode_t mode = 0;
 
     if (nr == __NR_open) {
         pathptr = req->data.args[0];
         flags   = (int)req->data.args[1];
+        mode    = (mode_t)req->data.args[2];
     } else { // __NR_openat
+        dirfd   = (int)req->data.args[0];
         pathptr = req->data.args[1];
         flags   = (int)req->data.args[2];
+        mode    = (mode_t)req->data.args[3];
     }
 
     char path[1024] = {0};
@@ -804,7 +920,32 @@ static void handle_open_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
 
     read_remote_cstr(c->tracee, pathptr, path, sizeof(path));
 
-    // Resolve relative paths against tracee cwd (which you already cache each loop)
+    // If openat() uses a directory fd (not AT_FDCWD) with a relative path, we cannot safely
+    // resolve its target path in user-space without *also* resolving that dirfd.
+    // Treat this as an escape attempt in strict modes.
+    if (nr == __NR_openat && dirfd != AT_FDCWD && path[0] != '/') {
+        emit_evt(c, "fs_open_dirfd_relative",
+                 "\"dirfd\":%d,\"path\":\"%s\",\"flags\":%d",
+                 dirfd, path, flags);
+        if (c->mode == MODE_DEV) {
+        // Mark the initial exec (the sample itself) so quarantine_drops has a boundary.
+        if (!c->saw_initial_exec && c->sample_abs[0] && strcmp(abs, c->sample_abs) == 0) {
+            c->saw_initial_exec = true;
+        }
+            respond_continue(c->notify_fd, req->id);
+            return;
+        }
+        if (c->mode == MODE_MALWARE) {
+            respond_errno(c->notify_fd, req->id, EPERM);
+            hard_kill(c, "openat_dirfd_relative");
+            return;
+        }
+        respond_errno(c->notify_fd, req->id, EPERM);
+        return;
+    }
+
+    // Resolve path: absolute paths are taken as-is; relative paths are joined against tracee cwd
+    // (in the child we chdir() into the jail to reduce relative-path risk).
     if (path[0] == '/') {
         snprintf(abs, sizeof(abs), "%s", path);
     } else {
@@ -812,26 +953,16 @@ static void handle_open_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
     }
     normalize_inplace(abs);
 
-    // Determine jail membership
-    bool in_jail = false;
-    if (c->write_jail[0]) {
-        // prefix match: abs starts with write_jail + "/" OR equals write_jail
-        size_t jl = strlen(c->write_jail);
-        if (strncmp(abs, c->write_jail, jl) == 0 &&
-            (abs[jl] == '\0' || abs[jl] == '/')) {
-            in_jail = true;
-        }
-    }
+    bool in_jail = (c->write_jail[0] && within_jail(c, abs));
 
-    // Log what happened
     emit_evt(c, "fs_open_attempt",
-             "\"sys\":\"%s\",\"path\":\"%s\",\"abs\":\"%s\",\"flags\":%d,\"in_jail\":%s",
+             "\"sys\":\"%s\",\"dirfd\":%d,\"path\":\"%s\",\"abs\":\"%s\",\"flags\":%d,\"in_jail\":%s",
              (nr == __NR_open ? "open" : "openat"),
-             path, abs, flags, in_jail ? "true" : "false");
+             dirfd, path, abs, flags, in_jail ? "true" : "false");
 
-    // Policy: allow reads anywhere, but writes only inside jail (unless you choose otherwise)
     bool wants_write = is_write_flags(flags);
 
+    // Reads anywhere are fine.
     if (!wants_write) {
         respond_continue(c->notify_fd, req->id);
         return;
@@ -839,10 +970,10 @@ static void handle_open_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
 
     // DEV: trace everything, allow writes anywhere (still logged above)
     if (c->mode == MODE_DEV) {
-        // Dev mode: allow all file opens so we can observe behavior,
-        // but optionally mark "dropped" artifacts for exec quarantine.
-        emit_evt(c, "fs_open_write_allowed_dev", "\"abs\":\"%s\",\"flags\":%d,\"in_jail\":%s", abs, flags, in_jail ? "true":"false");
-        if (c->quarantine_drops && in_jail && wants_write) {
+        emit_evt(c, "fs_open_write_allowed_dev",
+                 "\"abs\":\"%s\",\"flags\":%d,\"in_jail\":%s",
+                 abs, flags, in_jail ? "true" : "false");
+        if (c->quarantine_drops && in_jail) {
             taint_add(c, abs);
             emit_evt(c, "drop_mark", "\"abs\":\"%s\",\"why\":\"write_open\"", abs);
         }
@@ -850,9 +981,8 @@ static void handle_open_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
         return;
     }
 
-    // reveal-net: never allow writes (log intent, return EACCES), with persistence tripwires.
+    // reveal-net: never allow writes
     if (c->mode == MODE_REVEAL_NET) {
-        // Tripwire: obvious persistence surfaces
         if (strncmp(abs, "/etc/cron", 9) == 0 ||
             strncmp(abs, "/var/spool/cron", 14) == 0 ||
             strncmp(abs, "/etc/systemd", 12) == 0) {
@@ -866,15 +996,46 @@ static void handle_open_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
         return;
     }
 
-    // Other modes: allow writes inside jail, deny outside.
+
+    // Hardened: for write-intent opens inside jail, open the file in the supervisor and
+    // inject the resulting FD back into the tracee. This closes both symlink-escape and
+    // path-TOCTOU races for open/openat.
     if (in_jail) {
-        respond_continue(c->notify_fd, req->id);
+        if (c->jail_root_fd < 0) {
+            emit_evt(c, "fs_open_denied", "\"reason\":\"jail_fd_missing\",\"abs\":\"%s\"", abs);
+            respond_errno(c->notify_fd, req->id, EPERM);
+            if (c->mode == MODE_MALWARE) hard_kill(c, "jail_fd_missing");
+            return;
+        }
+
+        int localfd = open_under_jail(c, abs, flags, mode);
+        if (localfd < 0) {
+            int e = errno ? errno : EPERM;
+            emit_evt(c, "fs_open_denied", "\"reason\":\"open_under_jail_failed\",\"abs\":\"%s\",\"errno\":%d", abs, e);
+            respond_errno(c->notify_fd, req->id, e);
+            if (c->mode == MODE_MALWARE) hard_kill(c, "open_under_jail_failed");
+            return;
+        }
+
+        int irc = inject_fd_and_respond(c->notify_fd, req->id, localfd, flags);
+        int save = errno;
+        close(localfd);
+        if (irc < 0) {
+            emit_evt(c, "fs_open_denied", "\"reason\":\"fd_inject_failed\",\"abs\":\"%s\",\"errno\":%d", abs, -irc);
+            respond_errno(c->notify_fd, req->id, EINVAL);
+            if (c->mode == MODE_MALWARE) hard_kill(c, "fd_inject_failed");
+            errno = save;
+            return;
+        }
+
+        if (c->quarantine_drops) {
+            taint_add(c, abs);
+            emit_evt(c, "drop_mark", "\"abs\":\"%s\",\"why\":\"write_open\"", abs);
+        }
         return;
     }
 
-    // write outside jail
-    emit_evt(c, "fs_open_denied",
-             "\"reason\":\"write_outside_jail\",\"abs\":\"%s\"", abs);
+    emit_evt(c, "fs_open_denied", "\"reason\":\"write_outside_jail\",\"abs\":\"%s\"", abs);
 
     if (c->mode == MODE_MALWARE) {
         respond_errno(c->notify_fd, req->id, EPERM);
@@ -882,39 +1043,76 @@ static void handle_open_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
         return;
     }
 
-    // Dev/RE: allow but log (lets probes write to their own workspace while still signaling escape).
+    // RE: allow but log
     respond_continue(c->notify_fd, req->id);
 }
 
 
-
-
 static void handle_renameat(supervisor_ctx_t *c, struct seccomp_notif *req) {
-    char oldp[PATH_MAX], newp[PATH_MAX];
-    char oldabs[PATH_MAX], newabs[PATH_MAX];
+    int nr = (int)req->data.nr;
+    int olddirfd = AT_FDCWD;
+    int newdirfd = AT_FDCWD;
+    uint64_t oldptr = 0;
+    uint64_t newptr = 0;
 
-    read_remote_cstr(c->tracee, req->data.args[1], oldp, sizeof(oldp));
-    if (oldp[0] == '\0') {
-        emit_evt(c, "rename_read_fail", "\"which\":\"old\"");
+    if (nr == __NR_rename) {
+        oldptr = req->data.args[0];
+        newptr = req->data.args[1];
+    } else { // __NR_renameat
+        olddirfd = (int)req->data.args[0];
+        oldptr = req->data.args[1];
+        newdirfd = (int)req->data.args[2];
+        newptr = req->data.args[3];
+    }
+
+    char oldp[PATH_MAX] = {0};
+    char newp[PATH_MAX] = {0};
+    char oldabs[PATH_MAX] = {0};
+    char newabs[PATH_MAX] = {0};
+
+    read_remote_cstr(c->tracee, oldptr, oldp, sizeof(oldp));
+    read_remote_cstr(c->tracee, newptr, newp, sizeof(newp));
+
+    if (oldp[0] == '\0' || newp[0] == '\0') {
+        emit_evt(c, "rename_read_fail", "\"old\":\"%s\",\"new\":\"%s\"", oldp, newp);
         respond_errno(c->notify_fd, req->id, EFAULT);
         return;
     }
-    read_remote_cstr(c->tracee, req->data.args[3], newp, sizeof(newp));
-    if (newp[0] == '\0') {
-        emit_evt(c, "rename_read_fail", "\"which\":\"new\"");
-        respond_errno(c->notify_fd, req->id, EFAULT);
-        return;
+
+    if (nr == __NR_renameat) {
+        if ((olddirfd != AT_FDCWD && oldp[0] != '/') || (newdirfd != AT_FDCWD && newp[0] != '/')) {
+            emit_evt(c, "fs_rename_dirfd_relative",
+                     "\"olddirfd\":%d,\"newdirfd\":%d,\"old\":\"%s\",\"new\":\"%s\"",
+                     olddirfd, newdirfd, oldp, newp);
+            if (c->mode == MODE_DEV) {
+                respond_continue(c->notify_fd, req->id);
+                return;
+            }
+            if (c->mode == MODE_MALWARE) {
+                respond_errno(c->notify_fd, req->id, EPERM);
+                hard_kill(c, "renameat_dirfd_relative");
+                return;
+            }
+            respond_errno(c->notify_fd, req->id, EPERM);
+            return;
+        }
     }
 
-    path_join(c->tracee_cwd[0] ? c->tracee_cwd : "/", oldp, oldabs, sizeof(oldabs));
-    path_join(c->tracee_cwd[0] ? c->tracee_cwd : "/", newp, newabs, sizeof(newabs));
+    if (oldp[0] == '/') snprintf(oldabs, sizeof(oldabs), "%s", oldp);
+    else path_join(c->tracee_cwd[0] ? c->tracee_cwd : "/", oldp, oldabs, sizeof(oldabs));
+
+    if (newp[0] == '/') snprintf(newabs, sizeof(newabs), "%s", newp);
+    else path_join(c->tracee_cwd[0] ? c->tracee_cwd : "/", newp, newabs, sizeof(newabs));
+
     normalize_inplace(oldabs);
     normalize_inplace(newabs);
 
     bool old_in = within_jail(c, oldabs);
     bool new_in = within_jail(c, newabs);
-    emit_evt(c, "fs_rename_attempt", "\"old\":\"%s\",\"new\":\"%s\",\"old_in_jail\":%s,\"new_in_jail\":%s",
-             oldabs, newabs, old_in ? "true":"false", new_in ? "true":"false");
+    emit_evt(c, "fs_rename_attempt",
+             "\"sys\":\"%s\",\"olddirfd\":%d,\"newdirfd\":%d,\"old\":\"%s\",\"new\":\"%s\",\"old_in_jail\":%s,\"new_in_jail\":%s",
+             (nr == __NR_rename ? "rename" : "renameat"), olddirfd, newdirfd, oldabs, newabs,
+             old_in ? "true" : "false", new_in ? "true" : "false");
 
     if (c->mode == MODE_DEV) {
         if (c->quarantine_drops) {
@@ -930,33 +1128,77 @@ static void handle_renameat(supervisor_ctx_t *c, struct seccomp_notif *req) {
 }
 
 static void handle_unlink_like(supervisor_ctx_t *c, struct seccomp_notif *req) {
-    char path[1024], abs[4096];
-    bool is_unlinkat = (req->data.nr == __NR_unlinkat);
-    uint64_t pathptr = is_unlinkat ? req->data.args[1] : req->data.args[0];
+    int nr = (int)req->data.nr;
+    int dirfd = AT_FDCWD;
+    int flags = 0;
+    uint64_t pathptr = 0;
+
+    if (nr == __NR_unlink) {
+        pathptr = req->data.args[0];
+    } else { // __NR_unlinkat
+        dirfd = (int)req->data.args[0];
+        pathptr = req->data.args[1];
+        flags = (int)req->data.args[2];
+    }
+
+    char path[1024] = {0};
+    char abs[4096]  = {0};
 
     read_remote_cstr(c->tracee, pathptr, path, sizeof(path));
     if (path[0] == '\0') snprintf(path, sizeof(path), "<unreadable>");
-    path_join(c->tracee_cwd, path, abs, sizeof(abs));
+
+    if (nr == __NR_unlinkat && dirfd != AT_FDCWD && path[0] != '/') {
+        emit_evt(c, "fs_unlink_dirfd_relative",
+                 "\"dirfd\":%d,\"path\":\"%s\",\"flags\":%d",
+                 dirfd, path, flags);
+        if (c->mode == MODE_DEV) {
+            respond_continue(c->notify_fd, req->id);
+            return;
+        }
+        if (c->mode == MODE_MALWARE) {
+            respond_errno(c->notify_fd, req->id, EPERM);
+            hard_kill(c, "unlinkat_dirfd_relative");
+            return;
+        }
+        respond_errno(c->notify_fd, req->id, EPERM);
+        return;
+    }
+
+    if (path[0] == '/') snprintf(abs, sizeof(abs), "%s", path);
+    else path_join(c->tracee_cwd[0] ? c->tracee_cwd : "/", path, abs, sizeof(abs));
     normalize_inplace(abs);
 
     bool in_jail = within_jail(c, abs);
     emit_evt(c, "fs_unlink_attempt",
-             "\"sys\":\"%s\",\"path\":\"%s\",\"abs\":\"%s\",\"in_jail\":%s",
-             is_unlinkat ? "unlinkat":"unlink", path, abs, in_jail?"true":"false");
+             "\"sys\":\"%s\",\"dirfd\":%d,\"path\":\"%s\",\"abs\":\"%s\",\"in_jail\":%s",
+             (nr == __NR_unlink ? "unlink" : "unlinkat"), dirfd, path, abs, in_jail ? "true" : "false");
 
     if (!in_jail) {
-        if (c->mode == MODE_MALWARE) { hard_kill(c, "unlink_outside_jail"); respond_errno(c->notify_fd, req->id, EPERM); return; }
+        if (c->mode == MODE_MALWARE) {
+            respond_errno(c->notify_fd, req->id, EPERM);
+            hard_kill(c, "unlink_outside_jail");
+            return;
+        }
         // Dev/RE: allow but log
         respond_continue(c->notify_fd, req->id);
         return;
     }
+
     if (c->interactive_fs) {
         int ch = prompt_decision(abs);
-        if (ch == 'd' || ch == 'D' || ch == EOF) { respond_errno(c->notify_fd, req->id, EPERM); return; }
+        if (ch == 'd' || ch == 'D' || ch == EOF) {
+            respond_errno(c->notify_fd, req->id, EPERM);
+            return;
+        }
         respond_continue(c->notify_fd, req->id);
         return;
     }
-    if (c->mode == MODE_RE) { respond_continue(c->notify_fd, req->id); return; }
+
+    if (c->mode == MODE_RE) {
+        respond_continue(c->notify_fd, req->id);
+        return;
+    }
+
     respond_errno(c->notify_fd, req->id, EPERM);
 }
 
@@ -1007,11 +1249,10 @@ static void handle_exec(supervisor_ctx_t *c, struct seccomp_notif *req) {
     // Allow exactly one initial exec: the target sample itself.
     if (!c->saw_initial_exec && c->sample_abs[0] && strcmp(abs, c->sample_abs) == 0) {
         c->saw_initial_exec = true;
-    emit_evt(c, "exec_allow_dev", '"abs":"%s"', abs);
-    emit_evt(c, "exec_commit", '"abs":"%s","path":"%s","reason":"dev"', abs, path);
-    c->cache_tid = -1; // comm cache may change after exec
-    respond_continue(c->notify_fd, req->id);
-    return;
+        emit_evt(c, "exec_allow_sample", "\"abs\":\"%s\",\"path\":\"%s\"", abs, path);
+        c->cache_tid = -1; // comm cache may change after exec
+        respond_continue(c->notify_fd, req->id);
+        return;
     }
 
     emit_evt(c, "exec_denied", "\"abs\":\"%s\"", abs);
@@ -1056,47 +1297,70 @@ static void handle_fork(supervisor_ctx_t *c, struct seccomp_notif *req) {
 
 
 
-static void handle_net(supervisor_ctx_t *c, struct seccomp_notif *req) {
-    int nr = req->data.nr;
+static void decode_sockaddr_dst(supervisor_ctx_t *c,
+                                uint64_t addr_ptr,
+                                socklen_t addrlen,
+                                char *dst,
+                                size_t dst_sz,
+                                uint32_t *ip_be,
+                                uint16_t *port_be) {
+    if (dst_sz) dst[0] = '\0';
+    if (ip_be) *ip_be = 0;
+    if (port_be) *port_be = 0;
 
-    // Helper: decode IPv4 dst from sockaddr (best-effort).
-    auto void decode_dst(uint64_t addr_ptr, socklen_t addrlen, char *dst, size_t dst_sz, uint32_t *ip_be, uint16_t *port_be) {
-        struct sockaddr_storage ss;
-        memset(&ss, 0, sizeof(ss));
-        if (ip_be) *ip_be = 0;
-        if (port_be) *port_be = 0;
+    if (!c || !addr_ptr || addrlen == 0) return;
 
-        if (addr_ptr == 0 || addrlen == 0) {
-            snprintf(dst, dst_sz, "unknown");
-            return;
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    size_t n = addrlen;
+    if (n > sizeof(ss)) n = sizeof(ss);
+
+    if (read_remote(c->tracee, &ss, (void*)(uintptr_t)addr_ptr, n) < 0) return;
+
+    if (ss.ss_family == AF_INET && n >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *in = (struct sockaddr_in*)&ss;
+        if (ip_be) *ip_be = in->sin_addr.s_addr;
+        if (port_be) *port_be = in->sin_port;
+
+        if (dst && dst_sz) {
+            char ipstr[64] = {0};
+            inet_ntop(AF_INET, &in->sin_addr, ipstr, sizeof(ipstr));
+            snprintf(dst, dst_sz, "%s:%u", ipstr, (unsigned)ntohs(in->sin_port));
         }
-        size_t n = addrlen;
-        if (n > sizeof(ss)) n = sizeof(ss);
-        if (read_remote_mem(c->tracee, addr_ptr, &ss, n) <= 0) {
-            snprintf(dst, dst_sz, "unknown");
-            return;
-        }
-
-        if (ss.ss_family == AF_INET) {
-            struct sockaddr_in *in = (struct sockaddr_in*)&ss;
-            char ip[INET_ADDRSTRLEN];
-            memset(ip, 0, sizeof(ip));
-            if (!inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip))) {
-                snprintf(dst, dst_sz, "unknown");
-                return;
-            }
-            if (ip_be) *ip_be = in->sin_addr.s_addr;
-            if (port_be) *port_be = in->sin_port;
-            snprintf(dst, dst_sz, "%s:%u", ip, (unsigned)ntohs(in->sin_port));
-            return;
-        }
-
-        snprintf(dst, dst_sz, "unknown");
+    } else if (dst && dst_sz) {
+        snprintf(dst, dst_sz, "<af=%u>", (unsigned)ss.ss_family);
     }
+}
 
-    // Always allow socket() creation; we gate on connect/send.
+static bool net_cap_allows(supervisor_ctx_t *c, sock_track_t *t, size_t add_bytes) {
+    if (!c || !t) return true;
+    if (!t->allowed) return false;
+
+    uint64_t now = now_ms();
+    if (t->first_ts_ms == 0) t->first_ts_ms = now;
+
+    if (c->net_cap_ms && t->first_ts_ms && (now - t->first_ts_ms) > c->net_cap_ms) return false;
+    if (c->net_cap_sends && t->sends >= c->net_cap_sends) return false;
+    if (c->net_cap_bytes && (t->bytes_out + (uint64_t)add_bytes) > c->net_cap_bytes) return false;
+    return true;
+}
+
+static void net_cap_account(sock_track_t *t, size_t add_bytes) {
+    if (!t) return;
+    if (t->first_ts_ms == 0) t->first_ts_ms = now_ms();
+    t->sends += 1;
+    t->bytes_out += (uint64_t)add_bytes;
+}
+
+
+static void handle_net(supervisor_ctx_t *c, struct seccomp_notif *req) {
+    int nr = (int)req->data.nr;
+
     if (nr == __NR_socket) {
-        emit_evt(c, "net_attempt", "\"sys\":\"socket\"");
+        int domain = (int)req->data.args[0];
+        int type   = (int)req->data.args[1];
+        int proto  = (int)req->data.args[2];
+        emit_evt(c, "net_socket", "\"domain\":%d,\"type\":%d,\"proto\":%d", domain, type, proto);
         respond_continue(c->notify_fd, req->id);
         return;
     }
@@ -1109,141 +1373,70 @@ static void handle_net(supervisor_ctx_t *c, struct seccomp_notif *req) {
         char dst[128];
         uint32_t ip_be = 0;
         uint16_t port_be = 0;
-        decode_dst(addr_ptr, addrlen, dst, sizeof(dst), &ip_be, &port_be);
-
-        bool is_dns = (ntohs(port_be) == 53);
-        bool is_dot = (ntohs(port_be) == 853);
-
-        bool allowed = false;
-        const char *tag = "other";
-        if (is_dns) tag = "dns";
-        if (is_dot) tag = "dot";
-
-        if ((is_dns && c->allow_dns) || (is_dot && c->allow_dot)) {
-            allowed = true;
-        } else if (c->allowlist_count > 0) {
-            allowed = allowlist_matches(c, ip_be, port_be);
-        } else {
-            allowed = c->allow_any_connect;
-        }
+        decode_sockaddr_dst(c, addr_ptr, addrlen, dst, sizeof(dst), &ip_be, &port_be);
 
         sock_track_t *t = sock_get_or_add(c, fd);
         if (t) {
-            t->has_dst = (strcmp(dst, "unknown") != 0);
-            snprintf(t->dst, sizeof(t->dst), "%s", dst);
+            strncpy(t->dst, dst, sizeof(t->dst) - 1);
+            t->dst[sizeof(t->dst) - 1] = 0;
+            t->has_dst = true;
             t->ip_be = ip_be;
             t->port_be = port_be;
-            t->allowed = allowed;
-            if (t->first_ts_ms == 0) t->first_ts_ms = now_ms();
         }
 
-        emit_evt(c, "net_connect_attempt",
-                 "\"fd\":%d,\"dst\":\"%s\",\"allowed\":%s,\"tag\":\"%s\"",
-                 fd, dst, allowed ? "true" : "false", tag);
+        emit_evt(c, "net_connect_attempt", "\"fd\":%d,\"dst\":\"%s\"", fd, dst);
 
-        if (!allowed) {
-            respond_errno(c->notify_fd, req->id, ECONNREFUSED);
+        if (c->mode == MODE_DEV) {
+            // Dev: allow connect, but still track.
+            if (t) t->allowed = true;
+            respond_continue(c->notify_fd, req->id);
             return;
         }
 
-        respond_continue(c->notify_fd, req->id);
-        return;
-    }
+        // Default: deny unless allowlisted (plus optional DNS/DoT allowances).
+        bool allowed = false;
+        if (c->allow_any_connect) {
+            allowed = true;
+        } else if (port_be == htons(53) && c->allow_dns) {
+            allowed = true;
+        } else if (port_be == htons(853) && c->allow_dot) {
+            allowed = true;
+        } else if (allowlist_matches(c, ip_be, port_be)) {
+            allowed = true;
+        }
+        if (t) t->allowed = allowed;
 
-    // bind/listen tripwire: refuse services on non-loopback.
-    if (nr == __NR_bind) {
-        int fd = (int)req->data.args[0];
-        uint64_t addr_ptr = req->data.args[1];
-        socklen_t addrlen = (socklen_t)req->data.args[2];
-
-        char dst[128];
-        uint32_t ip_be = 0;
-        uint16_t port_be = 0;
-        decode_dst(addr_ptr, addrlen, dst, sizeof(dst), &ip_be, &port_be);
-
-        bool loopback = (ip_be == htonl(INADDR_LOOPBACK) || ip_be == 0); // 0.0.0.0 treated as non-loopback risk
-        emit_evt(c, "net_bind_attempt", "\"fd\":%d,\"addr\":\"%s\"", fd, dst);
-
-        if (c->mode == MODE_REVEAL_NET && !loopback) {
-            respond_errno(c->notify_fd, req->id, EACCES);
-            snapshot_and_kill(c, "bind_non_loopback");
+        if (allowed) {
+            emit_evt(c, "net_connect_allowed", "\"fd\":%d,\"dst\":\"%s\"", fd, dst);
+            respond_continue(c->notify_fd, req->id);
             return;
         }
 
-        respond_continue(c->notify_fd, req->id);
+        emit_evt(c, "net_connect_denied", "\"fd\":%d,\"dst\":\"%s\"", fd, dst);
+        respond_errno(c->notify_fd, req->id, EPERM);
         return;
-    }
-
-    if (nr == __NR_listen) {
-        int fd = (int)req->data.args[0];
-        emit_evt(c, "net_listen_attempt", "\"fd\":%d", fd);
-        if (c->mode == MODE_REVEAL_NET) {
-            respond_errno(c->notify_fd, req->id, EACCES);
-            snapshot_and_kill(c, "listen_attempt");
-            return;
-        }
-        respond_continue(c->notify_fd, req->id);
-        return;
-    }
-
-    // Unified outbound cap check (reveal-net)
-    auto bool cap_allows(sock_track_t *t, size_t add_bytes) {
-        if (!t) return true;
-        if (!t->allowed) return false;
-
-        uint64_t now = now_ms();
-        if (c->net_cap_ms && t->first_ts_ms && (now - t->first_ts_ms) > c->net_cap_ms) return false;
-        if (c->net_cap_sends && t->sends >= c->net_cap_sends) return false;
-        if (c->net_cap_bytes && (t->bytes_out + (uint64_t)add_bytes) > c->net_cap_bytes) return false;
-        return true;
-    }
-
-    auto void cap_account(sock_track_t *t, size_t add_bytes) {
-        if (!t) return;
-        if (t->first_ts_ms == 0) t->first_ts_ms = now_ms();
-        t->sends += 1;
-        t->bytes_out += (uint64_t)add_bytes;
     }
 
     if (nr == __NR_sendto) {
         int fd = (int)req->data.args[0];
         size_t len = (size_t)req->data.args[2];
-        uint64_t addr_ptr = req->data.args[4];
-        socklen_t addrlen = (socklen_t)req->data.args[5];
-
-        char dst[128];
-        uint32_t ip_be = 0;
-        uint16_t port_be = 0;
-        decode_dst(addr_ptr, addrlen, dst, sizeof(dst), &ip_be, &port_be);
 
         sock_track_t *t = sock_get_or_add(c, fd);
-        if (t && strcmp(dst, "unknown") != 0) {
-            t->has_dst = true;
-            snprintf(t->dst, sizeof(t->dst), "%s", dst);
-            t->ip_be = ip_be;
-            t->port_be = port_be;
-        }
-
         emit_evt(c, "net_sendto_attempt", "\"fd\":%d,\"dst\":\"%s\",\"len\":%zu", fd,
-                 (t && t->has_dst) ? t->dst : dst, len);
+                 (t && t->has_dst) ? t->dst : "unknown", len);
 
         if (c->mode == MODE_REVEAL_NET) {
-            if (!cap_allows(t, len)) {
+            if (!net_cap_allows(c, t, len)) {
                 emit_evt(c, "net_cap_hit", "\"fd\":%d,\"dst\":\"%s\"", fd, (t && t->has_dst) ? t->dst : "unknown");
                 respond_errno(c->notify_fd, req->id, ECONNRESET);
                 return;
             }
-            cap_account(t, len);
-        } else {
-            // Legacy behavior: only allow DNS if enabled.
-            bool is_dns = (strstr(dst, ":53") != NULL);
-            if (!(c->allow_dns && is_dns)) {
-                respond_errno(c->notify_fd, req->id, EPERM);
-                return;
-            }
+            net_cap_account(t, len);
+            respond_continue(c->notify_fd, req->id);
+            return;
         }
 
-        respond_continue(c->notify_fd, req->id);
+        respond_errno(c->notify_fd, req->id, EPERM);
         return;
     }
 
@@ -1272,18 +1465,17 @@ static void handle_net(supervisor_ctx_t *c, struct seccomp_notif *req) {
                  (t && t->has_dst) ? t->dst : "unknown", total);
 
         if (c->mode == MODE_REVEAL_NET) {
-            if (!cap_allows(t, total)) {
+            if (!net_cap_allows(c, t, total)) {
                 emit_evt(c, "net_cap_hit", "\"fd\":%d,\"dst\":\"%s\"", fd, (t && t->has_dst) ? t->dst : "unknown");
                 respond_errno(c->notify_fd, req->id, ECONNRESET);
                 return;
             }
-            cap_account(t, total);
-        } else {
-            respond_errno(c->notify_fd, req->id, EPERM);
+            net_cap_account(t, total);
+            respond_continue(c->notify_fd, req->id);
             return;
         }
 
-        respond_continue(c->notify_fd, req->id);
+        respond_errno(c->notify_fd, req->id, EPERM);
         return;
     }
 
@@ -1301,12 +1493,12 @@ static void handle_net(supervisor_ctx_t *c, struct seccomp_notif *req) {
                  t->has_dst ? t->dst : "unknown", len);
 
         if (c->mode == MODE_REVEAL_NET) {
-            if (!cap_allows(t, len)) {
+            if (!net_cap_allows(c, t, len)) {
                 emit_evt(c, "net_cap_hit", "\"fd\":%d,\"dst\":\"%s\"", fd, t->has_dst ? t->dst : "unknown");
                 respond_errno(c->notify_fd, req->id, ECONNRESET);
                 return;
             }
-            cap_account(t, len);
+            net_cap_account(t, len);
             respond_continue(c->notify_fd, req->id);
             return;
         }
@@ -1340,12 +1532,12 @@ static void handle_net(supervisor_ctx_t *c, struct seccomp_notif *req) {
                  t->has_dst ? t->dst : "unknown", total);
 
         if (c->mode == MODE_REVEAL_NET) {
-            if (!cap_allows(t, total)) {
+            if (!net_cap_allows(c, t, total)) {
                 emit_evt(c, "net_cap_hit", "\"fd\":%d,\"dst\":\"%s\"", fd, t->has_dst ? t->dst : "unknown");
                 respond_errno(c->notify_fd, req->id, ECONNRESET);
                 return;
             }
-            cap_account(t, total);
+            net_cap_account(t, total);
             respond_continue(c->notify_fd, req->id);
             return;
         }
@@ -1358,6 +1550,7 @@ static void handle_net(supervisor_ctx_t *c, struct seccomp_notif *req) {
         int fd = (int)req->data.args[0];
         sock_track_t *t = sock_get(c, fd);
         emit_evt(c, "net_recvfrom_attempt", "\"fd\":%d,\"dst\":\"%s\"", fd, (t && t->has_dst) ? t->dst : "unknown");
+
         if (c->mode == MODE_REVEAL_NET) {
             if (t && t->allowed) {
                 respond_continue(c->notify_fd, req->id);
@@ -1367,13 +1560,59 @@ static void handle_net(supervisor_ctx_t *c, struct seccomp_notif *req) {
             return;
         }
 
-        // Legacy: only DNS if enabled (best-effort)
         respond_errno(c->notify_fd, req->id, EPERM);
+        return;
+    }
+
+    // Fallback
+    respond_errno(c->notify_fd, req->id, EPERM);
+}
+
+
+
+
+static void handle_mmap(supervisor_ctx_t *c, struct seccomp_notif *req) {
+    // void *addr = (void*)req->data.args[0];
+    size_t len   = (size_t)req->data.args[1];
+    int prot     = (int)req->data.args[2];
+    int flags    = (int)req->data.args[3];
+    int fd       = (int)req->data.args[4];
+    uint64_t off = (uint64_t)req->data.args[5];
+
+    emit_evt(c, "mmap_attempt",
+             "\"len\":%zu,\"prot\":%d,\"flags\":%d,\"fd\":%d,\"off\":%llu",
+             len, prot, flags, fd, (unsigned long long)off);
+
+    // Harden: allow normal file-backed RX mappings (shared libs / main binary),
+    // but deny suspicious executable mappings:
+    //   - any mapping that is both writable and executable (W+X)
+    //   - anonymous executable mappings (common shellcode/JIT staging)
+    bool exec = (prot & PROT_EXEC) != 0;
+    bool write = (prot & PROT_WRITE) != 0;
+    bool anon = ((flags & MAP_ANONYMOUS) != 0) || (fd < 0);
+
+    if (exec && (write || anon)) {
+        if (c->mode == MODE_DEV) {
+            emit_evt(c, "mmap_exec_suspicious_allow_dev",
+                     "\"prot\":%d,\"flags\":%d,\"fd\":%d,\"len\":%zu",
+                     prot, flags, fd, len);
+            respond_continue(c->notify_fd, req->id);
+            return;
+        }
+
+        emit_evt(c, "mmap_exec_denied",
+                 "\"prot\":%d,\"flags\":%d,\"fd\":%d,\"len\":%zu,\"anon\":%s,\"wx\":%s",
+                 prot, flags, fd, len, anon ? "true" : "false", write ? "true" : "false");
+        respond_errno(c->notify_fd, req->id, EPERM);
+        if (c->mode == MODE_MALWARE) {
+            snapshot_and_kill(c, "mmap_exec_suspicious");
+        }
         return;
     }
 
     respond_continue(c->notify_fd, req->id);
 }
+
 
 
 static void handle_mprotect(supervisor_ctx_t *c, struct seccomp_notif *req) {
@@ -1543,6 +1782,9 @@ static void *supervisor_thread(void *arg) {
             case __NR_recvfrom:
                 handle_net(c, req);
                 break;
+            case __NR_mmap:
+                handle_mmap(c, req);
+                break;
             case __NR_mprotect:
                 handle_mprotect(c, req);
                 break;
@@ -1577,6 +1819,7 @@ static void usage(const char *argv0) {
 int main(int argc, char **argv) {
     supervisor_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.jail_root_fd = -1;
     ctx.timeout_ms = 4000;
     ctx.max_events = 200;
     ctx.mode = MODE_MALWARE;
@@ -1675,20 +1918,23 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    // Resolve sample absolute path (for the "allow initial exec" boundary)
+    // Resolve CWD for making paths absolute
     char cwd[4096];
     if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "/");
-    path_join(cwd, argv[i], ctx.sample_abs, sizeof(ctx.sample_abs));
-    normalize_inplace(ctx.sample_abs);
 
-    if (mkdir_p(ctx.outdir) != 0 && errno != EEXIST)
-        die("mkdir_p(outdir) failed: %s", strerror(errno));
-
-    if (ctx.write_jail[0]) {
-        if (mkdir_p(ctx.write_jail) != 0 && errno != EEXIST)
-            die("mkdir_p(write_jail) failed: %s", strerror(errno));
+    // Normalize outdir to an absolute path
+    if (ctx.outdir[0] != '/') {
+        char outabs[4096];
+        path_join(cwd, ctx.outdir, outabs, sizeof(outabs));
+        normalize_inplace(outabs);
+        snprintf(ctx.outdir, sizeof(ctx.outdir), "%s", outabs);
+    } else {
+        normalize_inplace(ctx.outdir);
     }
 
+    // Resolve sample absolute path (for the "allow initial exec" boundary)
+    path_join(cwd, argv[i], ctx.sample_abs, sizeof(ctx.sample_abs));
+    normalize_inplace(ctx.sample_abs);
 
     if (ctx.mode == MODE_REVEAL_NET) {
         // Operator-safe defaults for "reveal but don't work" networking.
@@ -1711,6 +1957,34 @@ int main(int argc, char **argv) {
         }
         ctx.interactive_fs = false;
         ctx.allow_any_connect = true;
+    }
+
+    // Normalize write_jail to an absolute path (and strip trailing slash)
+    if (ctx.write_jail[0]) {
+        char jailabs[4096];
+        if (ctx.write_jail[0] != '/') {
+            path_join(cwd, ctx.write_jail, jailabs, sizeof(jailabs));
+        } else {
+            snprintf(jailabs, sizeof(jailabs), "%s", ctx.write_jail);
+        }
+        normalize_inplace(jailabs);
+        size_t jl = strlen(jailabs);
+        while (jl > 1 && jailabs[jl-1] == '/') { jailabs[jl-1] = '\0'; jl--; }
+        snprintf(ctx.write_jail, sizeof(ctx.write_jail), "%s", jailabs);
+    }
+
+    if (mkdir_p(ctx.outdir) != 0 && errno != EEXIST)
+        die("mkdir_p(outdir) failed: %s", strerror(errno));
+
+    if (ctx.write_jail[0]) {
+        if (mkdir_p(ctx.write_jail) != 0 && errno != EEXIST)
+            die("mkdir_p(write_jail) failed: %s", strerror(errno));
+
+        // Keep an O_PATH fd on the jail root for safe openat2/openat.
+        ctx.jail_root_fd = open(ctx.write_jail, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (ctx.jail_root_fd < 0) {
+            die("open(write_jail O_PATH) failed: %s", strerror(errno));
+        }
     }
 
     // Open events.ndjson
@@ -1745,15 +2019,11 @@ int main(int argc, char **argv) {
 
         fprintf(stderr, "[SoftRX] child: installing seccomp listener...\n"); fflush(stderr);
         int listener_fd = install_listener_filter();
-        fprintf(stderr, "[SoftRX] child: listener_fd=%d\n", listener_fd); fflush(stderr);
-        fprintf(stderr, "[SoftRX] child: sending listener fd to parent...\n"); fflush(stderr);
         send_fd(sp[1], listener_fd);
-        fprintf(stderr, "[SoftRX] child: sent listener fd\n"); fflush(stderr);
         close(listener_fd);
         close(sp[1]);
 
         char **child_argv = &argv[i];
-        fprintf(stderr, "[SoftRX] child: execv(%s)\n", child_argv[0]); fflush(stderr);
         execv(child_argv[0], child_argv);
 
         perror("execv");
